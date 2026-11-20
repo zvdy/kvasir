@@ -1,0 +1,21 @@
+name: Feature / task
+description: Propose work; accepted items become entries in .agent/backlog.yaml
+labels: [enhancement]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: Commands that must exit 0 and measurable criteria.
+    validations:
+      required: true
+  - type: input
+    id: files
+    attributes:
+      label: Files likely touched

@@ -2,9 +2,14 @@
 name = "kvasir"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.100"
+description = "LLM inference engine in Rust with hand-written CUDA kernels"
+license = "Apache-2.0"
+repository = "https://github.com/zvdy/kvasir"
+publish = false
 
 [dependencies]
-cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "cuda-version-from-build-system", "dynamic-linking", "f16"] }
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "cuda-13040", "dynamic-linking", "f16"] }
 safetensors = "0.8"
 memmap2 = "0.9"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
@@ -18,3 +23,14 @@ rand = "0.9"
 [[bin]]
 name = "kvasir"
 path = "src/bin/kvasir.rs"
+
+[features]
+gpu-tests = []
+
+[[test]]
+name = "kernels"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "weights"
+required-features = ["gpu-tests"]

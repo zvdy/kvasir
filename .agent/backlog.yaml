@@ -1,0 +1,116 @@
+# Ordered backlog. Selection rule: first `todo` whose depends_on are all `done`. One task per run.
+# status: todo | in_progress | done | blocked
+# acceptance: shell commands that must exit 0 (in addition to `make ci-local`), plus criteria for the reviewer.
+
+tasks:
+  - id: ENV-weights
+    title: Llama 3.2 1B weights present in models/Llama-3.2-1B
+    status: blocked
+    depends_on: []
+    files: []
+    acceptance:
+      - test -f models/Llama-3.2-1B/model.safetensors
+    notes: >
+      Human action: `hf auth login` with an account approved for meta-llama/Llama-3.2-1B, then
+      `hf download meta-llama/Llama-3.2-1B --local-dir models/Llama-3.2-1B`. Agents mark this done
+      when `make doctor` reports weights=ok.
+
+  - id: S1-01
+    title: Workspace of preallocated activation buffers
+    status: todo
+    depends_on: []
+    files: [engine/src/model/workspace.rs, engine/src/model/mod.rs]
+    acceptance:
+      - cargo test --workspace workspace
+    notes: >
+      Buffers sized from LlamaConfig and max tokens per call (DESIGN §2 table). Pure size computation
+      must be unit-testable on CPU (separate the size math from allocation). No allocation after `new`.
+
+  - id: S1-02
+    title: Contiguous KvCache
+    status: todo
+    depends_on: []
+    files: [engine/src/kv/mod.rs, engine/tests/kv.rs, engine/Cargo.toml]
+    acceptance:
+      - cargo test --release --features gpu-tests --test kv
+    notes: >
+      K and V each [layers, n_kv, max_seq, head_dim] FP16 (DESIGN §2). Per-layer views for kv_append and
+      attention. GPU test appends at several pos0 values and reads back exact positions. Register the
+      test with required-features = ["gpu-tests"].
+
+  - id: S1-03
+    title: Llama forward pass (prefill and decode)
+    status: todo
+    depends_on: [S1-01, S1-02]
+    files: [engine/src/model/llama.rs, engine/src/model/mod.rs, engine/tests/forward.rs, engine/Cargo.toml]
+    acceptance:
+      - cargo test --release --features gpu-tests --test forward
+    notes: >
+      Use the existing launch wrappers in engine/src/gpu/kernels.rs and gemm.rs. Test with the tiny
+      synthetic config from engine/tests/weights.rs against a CPU f32 reference forward written in the
+      test; prefill of N tokens must match N sequential decodes. Thresholds justified in DESIGN.md.
+
+  - id: S1-04
+    title: Host sampling (greedy, temperature, top-p)
+    status: todo
+    depends_on: []
+    files: [engine/src/sampling.rs]
+    acceptance:
+      - cargo test --workspace sampling
+    notes: Seeded RNG; same seed + logits gives the same token. CPU-only unit tests.
+
+  - id: S1-05
+    title: CLI `kvasir generate`
+    status: todo
+    depends_on: [S1-03, S1-04]
+    files: [engine/src/bin/kvasir.rs]
+    acceptance:
+      - cargo run --release -- generate --help
+    notes: >
+      `kvasir generate --model <dir> --prompt <text> --max-tokens N --seed S [--temperature T --top-p P]`.
+      Uses tokenizers + clap (already dependencies). Prints tokens/s at the end.
+
+  - id: S1-06
+    title: HF reference dumper
+    status: todo
+    depends_on: []
+    files: [ref/dump_logits.py, ref/requirements.txt, Makefile]
+    acceptance:
+      - python3 -m py_compile ref/dump_logits.py
+    notes: >
+      Per DESIGN §6. Pinned requirements. `make ref` creates ref/.venv and writes ref/out/. Exits 0 with
+      a clear message when weights are absent.
+
+  - id: S1-07
+    title: Logit-matching integration test
+    status: todo
+    depends_on: [S1-03, S1-06, ENV-weights]
+    files: [engine/tests/logits.rs, engine/Cargo.toml, Makefile]
+    acceptance:
+      - make ref
+      - cargo test --release --features gpu-tests,model-tests --test logits -- --nocapture
+    notes: >
+      Thresholds exactly as DESIGN §6, calibrated from the HF-FP16 floor. New feature `model-tests`;
+      add `make test-model`. Not part of `ci-local` until weights are routinely present.
+
+  - id: S1-08
+    title: Decode throughput benchmark vs roofline
+    status: todo
+    depends_on: [S1-05, ENV-weights]
+    files: [engine/src/bin/kvasir.rs, DESIGN.md, bench/baseline.json]
+    acceptance:
+      - cargo run --release -- bench --model models/Llama-3.2-1B --json > /dev/null
+    notes: >
+      `kvasir bench` reports prefill and decode tok/s and % of the roofline from Weights::decode_bytes().
+      Commit bench/baseline.json; later runs flag regressions > 5%.
+
+  - id: H-01
+    title: Kernel microbenchmarks with stored baseline
+    status: todo
+    depends_on: []
+    files: [engine/benches/, engine/Cargo.toml, Makefile, bench/]
+    acceptance:
+      - make bench
+    notes: >
+      Criterion benches for each kernel at Llama dims behind the gpu-tests feature. `make bench` compares
+      against bench/kernels-baseline.json and fails on > 10% regression.

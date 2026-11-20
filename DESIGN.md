@@ -115,8 +115,11 @@ are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong in
   build time. The safe cudarc `Gemm<f16>` only produces FP16 output, so `gpu/gemm.rs` calls `cublas::result::gemm_ex`
   directly (needed for FP32 logits).
 - `ctx.disable_event_tracking()` is called: with a single stream cudarc's per-allocation events are pure overhead.
-- nvcc 13.4 at `/opt/cuda`; `build.rs` honours `NVCC`, `CUDA_PATH`, `CUDA_HOME`.
-- Known cosmetic clippy lints (`is_multiple_of`, `chunks_exact`) left as is.
+- CUDA toolkit 13.x (nvcc at `/opt/cuda` locally); `build.rs` honours `NVCC`, `CUDA_PATH`, `CUDA_HOME`. cudarc's
+  version feature is pinned to `cuda-13040` because 0.19 rejects newer minors (13.5) under
+  `cuda-version-from-build-system`; the driver API is backward compatible.
+- Rust toolchain pinned in `rust-toolchain.toml`. Clippy runs with `-D warnings` in `make ci`.
+- GPU tests (`engine/tests/kernels.rs`, `weights.rs`) need `--features gpu-tests`; plain `cargo test` runs CPU tests only.
 
 ## 6. Verification plan (forward pass + reference, not yet built)
 
@@ -136,5 +139,5 @@ are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong in
 | gpu wrappers, build.rs | done |
 | 8 kernels + CPU-reference tests, GEMM test | done, 16/16 passing |
 | config, RoPE table, weight loader | done; loader tested on a synthetic BF16 checkpoint (exact fused-layout check) |
-| real Llama 3.2 1B weights | **missing** — `hf download` was refused (not logged in / gated repo not approved) |
-| forward pass, KV cache, sampling, CLI, ref script, logit test, perf report | waiting for sign-off on this document |
+| real Llama 3.2 1B weights | **missing**: gated repo, backlog `ENV-weights` |
+| forward pass, KV cache, sampling, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-01 … S1-08) |
