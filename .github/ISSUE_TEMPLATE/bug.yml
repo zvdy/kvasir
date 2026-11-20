@@ -1,0 +1,23 @@
+name: Bug report
+description: Wrong output, crash, or build failure
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Command run, observed vs expected output.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: make doctor output
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: text
