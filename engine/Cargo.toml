@@ -12,13 +12,13 @@ publish = false
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "cuda-13040", "dynamic-linking", "f16"] }
 safetensors = "0.8"
 memmap2 = "0.9"
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
-rand = "0.9"
+rand = "0.10"
 
 [[bin]]
 name = "kvasir"
