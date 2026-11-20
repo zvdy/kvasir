@@ -3,3 +3,4 @@
 /ref/.venv
 /ref/out
 __pycache__
+.claude/settings.local.json
