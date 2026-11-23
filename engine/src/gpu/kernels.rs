@@ -21,7 +21,33 @@ pub struct Kernels {
     add_inplace: CudaFunction,
     bf16_to_f16: CudaFunction,
     kv_append: CudaFunction,
-    attention: CudaFunction,
+    attention_decode: Vec<CudaFunction>,
+    attention_prefill: Vec<CudaFunction>,
+}
+
+const ATT_HEAD_DIMS: [usize; 2] = [64, 128];
+const ATT_GROUPS: [usize; 4] = [1, 2, 4, 8];
+const ATT_THREADS: u32 = 128;
+const ATT_PREFILL_ROWS: usize = 64;
+const ATT_DEC_MIN_CHUNK: usize = 256;
+const ATT_DEC_MAX_SPLITS: usize = 128; // = DEC_MAX_SPLITS in attention.cu
+
+fn att_variant(head_dim: usize, group: usize) -> Option<usize> {
+    let h = ATT_HEAD_DIMS.iter().position(|&d| d == head_dim)?;
+    let g = ATT_GROUPS.iter().position(|&x| x == group)?;
+    Some(h * ATT_GROUPS.len() + g)
+}
+
+/// FP32 elements of the `scratch` buffer that [`Gpu::attention`] needs (decode split-K partials and
+/// per-head counters). Allocate it zeroed; the kernel leaves the counters at zero after every call.
+pub fn attention_scratch_len(n_q: usize, head_dim: usize) -> usize {
+    n_q + ATT_DEC_MAX_SPLITS * n_q * (head_dim + 2)
+}
+
+fn decode_split(kv_len: usize) -> (usize, usize) {
+    let target = kv_len.div_ceil(ATT_DEC_MIN_CHUNK).min(ATT_DEC_MAX_SPLITS);
+    let chunk = kv_len.div_ceil(target);
+    (chunk, kv_len.div_ceil(chunk))
 }
 
 impl Kernels {
@@ -32,7 +58,18 @@ impl Kernels {
         let silu = load_ptx(ctx, ptx!("silu_mul"))?;
         let elem = load_ptx(ctx, ptx!("elementwise"))?;
         let attn = load_ptx(ctx, ptx!("attention"))?;
+        let variants = |kind: &str| -> Result<Vec<CudaFunction>> {
+            let mut v = Vec::new();
+            for hd in ATT_HEAD_DIMS {
+                for g in ATT_GROUPS {
+                    v.push(attn.load_function(&format!("attention_{kind}_{hd}_{g}"))?);
+                }
+            }
+            Ok(v)
+        };
         Ok(Self {
+            attention_decode: variants("decode")?,
+            attention_prefill: variants("prefill")?,
             embedding_gather: embedding.load_function("embedding_gather")?,
             rmsnorm: rmsnorm.load_function("rmsnorm")?,
             rope_inplace: rope.load_function("rope_inplace")?,
@@ -40,7 +77,6 @@ impl Kernels {
             add_inplace: elem.load_function("add_inplace")?,
             bf16_to_f16: elem.load_function("bf16_to_f16")?,
             kv_append: elem.load_function("kv_append")?,
-            attention: attn.load_function("attention")?,
         })
     }
 }
@@ -52,8 +88,6 @@ fn i32_of(x: usize, what: &str) -> Result<i32> {
 fn grid_stride(n: usize) -> u32 {
     (n.div_ceil(256)).clamp(1, 65535 * 4) as u32
 }
-
-const MAX_STATIC_SMEM: usize = 48 * 1024;
 
 impl Gpu {
     pub fn embedding_gather(
@@ -290,6 +324,8 @@ impl Gpu {
         Ok(())
     }
 
+    /// Causal GQA attention over the cache (DESIGN.md §3). `scratch` must hold
+    /// [`attention_scratch_len`]`(n_q, head_dim)` floats; only decode (`t == 1`) uses it.
     #[allow(clippy::too_many_arguments)]
     pub fn attention(
         &self,
@@ -297,6 +333,7 @@ impl Gpu {
         kc: &CudaView<f16>,
         vc: &CudaView<f16>,
         out: &mut CudaViewMut<f16>,
+        scratch: &mut CudaViewMut<f32>,
         t: usize,
         pos0: usize,
         n_q: usize,
@@ -309,10 +346,13 @@ impl Gpu {
             n_kv > 0 && n_q.is_multiple_of(n_kv),
             "attention: n_q {n_q} not a multiple of n_kv {n_kv}"
         );
-        ensure_shape!(
-            head_dim > 0 && 128 % head_dim == 0,
-            "attention: head_dim {head_dim} must divide 128"
-        );
+        let group = n_q / n_kv;
+        let Some(variant) = att_variant(head_dim, group) else {
+            return Err(KvasirError::Shape(format!(
+                "attention: unsupported head_dim {head_dim} / group {group} (want {ATT_HEAD_DIMS:?} / {ATT_GROUPS:?})"
+            )));
+        };
+        ensure_shape!(t > 0, "attention: t must be > 0");
         ensure_shape!(
             qkv.len() == t * stride,
             "attention: qkv has {} elems, want {t}x{stride}",
@@ -333,40 +373,67 @@ impl Gpu {
             "attention: kv length {} exceeds max_seq {max_seq}",
             pos0 + t
         );
-        let smem = (pos0 + t + head_dim + 128) * 4;
         ensure_shape!(
-            smem <= MAX_STATIC_SMEM,
-            "attention: kv length {} needs {smem} B of shared memory (> 48 KiB)",
-            pos0 + t
+            scratch.len() >= attention_scratch_len(n_q, head_dim),
+            "attention: scratch has {} elems, want {}",
+            scratch.len(),
+            attention_scratch_len(n_q, head_dim)
         );
-        let (p, nq, nk, hd, ms, rs) = (
+        let (p, nq, ms, rs) = (
             i32_of(pos0, "pos0")?,
             i32_of(n_q, "n_q")?,
-            i32_of(n_kv, "n_kv")?,
-            i32_of(head_dim, "head_dim")?,
             i32_of(max_seq, "max_seq")?,
             i32_of(stride, "row_stride")?,
         );
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let cfg = LaunchConfig {
-            grid_dim: (n_q as u32, t as u32, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: smem as u32,
-        };
-        let mut b = self.stream.launch_builder(&self.kernels.attention);
-        b.arg(qkv)
-            .arg(kc)
-            .arg(vc)
-            .arg(out)
-            .arg(&p)
-            .arg(&nq)
-            .arg(&nk)
-            .arg(&hd)
-            .arg(&ms)
-            .arg(&rs)
-            .arg(&scale);
-        // SAFETY: argument order/types match `attention`; sizes checked above.
-        unsafe { b.launch(cfg)? };
+        let scale_log2 = std::f32::consts::LOG2_E / (head_dim as f32).sqrt();
+        if t == 1 {
+            let kv_len = pos0 + 1;
+            let (chunk, splits) = decode_split(kv_len);
+            let (kl, ch) = (i32_of(kv_len, "kv_len")?, i32_of(chunk, "chunk")?);
+            let cfg = LaunchConfig {
+                grid_dim: (n_kv as u32, splits as u32, 1),
+                block_dim: (ATT_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = self.stream.launch_builder(&self.kernels.attention_decode[variant]);
+            b.arg(qkv)
+                .arg(kc)
+                .arg(vc)
+                .arg(out)
+                .arg(scratch)
+                .arg(&kl)
+                .arg(&nq)
+                .arg(&ms)
+                .arg(&ch)
+                .arg(&scale_log2);
+            // SAFETY: argument order/types match `attention_decode_*`; sizes and scratch length checked above.
+            // The split counters in `scratch` are zero between calls (single stream, ADR 0004).
+            unsafe { b.launch(cfg)? };
+        } else {
+            let tiles = t.div_ceil(ATT_PREFILL_ROWS / group);
+            let (tt, tiles) = (
+                i32_of(t, "t")?,
+                u32::try_from(tiles).map_err(|_| KvasirError::Shape("attention: t too large".into()))?,
+            );
+            let cfg = LaunchConfig {
+                grid_dim: (tiles, n_kv as u32, 1),
+                block_dim: (ATT_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = self.stream.launch_builder(&self.kernels.attention_prefill[variant]);
+            b.arg(qkv)
+                .arg(kc)
+                .arg(vc)
+                .arg(out)
+                .arg(&tt)
+                .arg(&p)
+                .arg(&nq)
+                .arg(&ms)
+                .arg(&rs)
+                .arg(&scale_log2);
+            // SAFETY: argument order/types match `attention_prefill_*`; sizes checked above.
+            unsafe { b.launch(cfg)? };
+        }
         Ok(())
     }
 }

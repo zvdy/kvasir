@@ -25,6 +25,7 @@ engine/
   src/bin/kvasir.rs   `kvasir generate --model <dir> --prompt ...`       [not written yet]
 engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint), workspace.rs, kv.rs (cache placement),
                       forward.rs (tiny model vs CPU f64 reference forward)
+engine/benches/       kernels.rs: per-kernel microbenchmarks vs bench/kernels-baseline.json (`make bench`)
 tests/ , ref/         logit-matching test and HF reference dumper        [not written yet]
 ```
 
@@ -101,7 +102,7 @@ unchanged; `len` only advances after the last layer. `Llama::new` rejects `max_t
 above the attention kernel's shared-memory limit (`(max_seq + head_dim + 128)·4 B ≤ 48 KiB`, 12 096 for
 head_dim 64), so the limit surfaces at construction instead of mid-generation. `reset`/`truncate` rewind the cache.
 
-## 3. Kernels (naive, correct, validated against CPU before use)
+## 3. Kernels (validated against CPU before use)
 
 | kernel | grid × block | notes |
 |---|---|---|
@@ -109,12 +110,38 @@ head_dim 64), so the limit surfaces at construction instead of mid-generation. `
 | `rmsnorm` | rows × 256 | FP32 sum of squares; block reduce via warp shuffles |
 | `rope_inplace` | T × 128 | one thread per (head, pair) |
 | `kv_append` | T × 128 | |
-| `attention` | (32, T) × 128 | block per (head, query). Scores in dynamic smem (FP32), 3 passes (max, exp+sum, P·V). Needs `(pos0+T+64+128)·4 B ≤ 48 KiB` → kv length ≲ 11.9k; wrapper errors beyond that |
+| `attention_decode_{hd}_{g}` | (8, splits) × 128 | `T = 1`, flash-decoding; see below |
+| `attention_prefill_{hd}_{g}` | (⌈T/(64/g)⌉, 8) × 128 | `T > 1`, FA2-style on tensor cores; see below |
 | `silu_mul` | grid-stride | |
 | `add_inplace` | grid-stride | residual add |
 | `bf16_to_f16` | grid-stride | counts values outside FP16 range |
 
-Unit-test results (`cargo test --test kernels`, 16 tests): all outputs are within one FP16 output rounding
+**Attention** (A-01). One wrapper, `Gpu::attention(qkv, kc, vc, out, scratch, t, pos0, n_q, n_kv, head_dim, max_seq)`,
+dispatches on `t`. Variants are compiled for `head_dim ∈ {64, 128}` × GQA group `g = n_q/n_kv ∈ {1, 2, 4, 8}`; other
+shapes are a `Shape` error. `qkv`, `kc`, `vc` must be 16-byte aligned (true for allocations and per-layer cache
+slices). There is no kv-length cap beyond `max_seq` (tested to 40k). Scores are FP32 in the exp2
+domain (q·k scaled by `log2 e/√d`), with online (running max/sum) softmax.
+
+- *Decode:* one block per (KV head, context split), so each K/V row is loaded once for all `g` query heads. Eight
+  lanes read one 128-byte row with 16-byte `ld.global.cs` loads (a warp covers 4 rows per load, 4 loads in flight per
+  lane, next round prefetched); partial dot products are reduced with 3 shuffles. Splits: `chunk = max(256,
+  ⌈len/128⌉)` keys, `splits = ⌈len/chunk⌉` (≤ 128). With one split the block writes `out` directly. Otherwise each block
+  writes `(m, l, acc[hd])` to `scratch` and bumps a per-KV-head counter; the last block to arrive merges all splits and
+  resets the counter to 0 (last-block-reduces, no second launch). Chunk 256 beat 64/128 at every benched context:
+  fewer, longer streams per block lose less to ramp/tail than more blocks gain in parallelism.
+- *Scratch:* `scratch: &mut CudaViewMut<f32>` with at least `kernels::attention_scratch_len(n_q, head_dim)` =
+  `n_q + 128·n_q·(head_dim+2)` floats (1.08 MB for Llama 3.2 1B, one buffer shared by all layers). Layout: `n_q` u32
+  counter words, then partials `[split, n_q, head_dim+2]`. It must be **zeroed once at allocation** (`alloc_zeros`);
+  every call leaves the counters at zero. Prefill does not touch it. Owned by `Workspace` (or the KV cache) — the
+  wrapper does not allocate.
+- *Prefill:* block = 64/g query tokens × g heads of one KV head = 64 query rows, 4 warps × 16 rows. Q fragments live
+  in registers; K/V tiles (64 keys for hd 64, 32 for hd 128) are double-buffered in smem with `cp.async` (zero-filled
+  past the causal end, rows padded by 16 B for conflict-free access). S = QKᵀ and O += PV use
+  `mma.sync.m16n8k16` (FP16 in, FP32 accumulate); S accumulators are re-packed in registers as the A operand of PV and
+  V fragments come from `ldmatrix.trans`. Causal mask per element (`key ≤ pos0 + token`); query tiles are scheduled
+  longest-first. No split over keys, so prefill with a long prefix and few new tokens under-fills the GPU.
+
+Unit-test results (`cargo test --test kernels`, 25 tests): all outputs are within one FP16 output rounding
 (≈ 4.9e-4 relative) of an f32/f64 CPU reference; FP32-output GEMM is within 7e-7 absolute. Tolerances in the tests
 are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong index or missing term fails loudly.
 
@@ -128,8 +155,10 @@ are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong in
    We keep the product in FP32 and round once. Strictly more accurate than HF-FP16, same as HF-FP32 in the limit.
 3. **Fused projections:** `q|k|v` and `gate|up` are concatenated at load time (one GEMM each instead of 3/2).
    Mathematically identical; per-output-element accumulation order is cuBLAS's choice either way.
-4. **Attention** is a plain softmax(QKᵀ/√d)V with FP32 scores and FP32 accumulation, FP16 output (no
-   flash/online softmax yet). Max subtraction is exact; `__expf` is used (≈2 ulp FP32, far below FP16 rounding).
+4. **Attention** is softmax(QKᵀ/√d)V with FP32 scores and accumulation, FP16 output, computed with an online
+   softmax in base 2 (`exp2f`, ≈2 ulp). Decode is FP32 throughout. Prefill rounds P to FP16 for the tensor-core P·V
+   (as FA2 does) and sums the *rounded* P into the denominator so the weights still sum to one. All attention tests
+   stay within the unchanged `2e-3 rel + 1e-3 abs` (max error 6.6e-4, same as the old kernel).
 5. **RoPE tables** are computed in f64 and rounded once to f32 (HF: f32 throughout). Difference ~1e-7.
 6. **LM head** outputs FP32 logits directly from the FP16 GEMM (HF-FP32 has FP32 weights; we cannot).
 7. **Tied embeddings:** the embedding matrix doubles as the LM head (`tie_word_embeddings = true` for this model);
@@ -189,10 +218,49 @@ activation. Metric: max |logit error| over all rows.
 | step | state |
 |---|---|
 | gpu wrappers, build.rs | done |
-| 8 kernels + CPU-reference tests, GEMM test | done, 16/16 passing |
+| 8 kernels + CPU-reference tests, GEMM test | done, 25/25 passing |
 | config, RoPE table, weight loader | done; loader tested on a synthetic BF16 checkpoint (exact fused-layout check) |
 | real Llama 3.2 1B weights | **missing**: gated repo, backlog `ENV-weights` |
 | workspace (activation buffers, ids upload, logits D2H into a reused host buffer) | done (S1-01); CPU size tests + GPU alloc/round-trip test |
 | KV cache (`KvCache`) | done (S1-02); `tests/kv.rs` (6 GPU tests: exact placement at several `pos0`, overflow errors, attention via layer view) |
 | forward pass (`Llama::forward`, prefill / chunked prefill / decode) | done (S1-03); `tests/forward.rs` (6 GPU tests vs f64 CPU reference on a synthetic model, thresholds §6) |
+| kernel microbenchmarks + stored baseline (`make bench`, H-01) | done; numbers in §8 |
+| flash-decoding / FA2 prefill attention (A-01) | done; decode ctx 2048 at 60% of DRAM bandwidth, prefill T=128 25× faster |
 | sampling, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-04 … S1-08) |
+
+## 8. Kernel microbenchmarks
+
+`make bench` (`engine/benches/kernels.rs`, `harness = false`, needs `gpu-tests`) times every kernel at Llama 3.2 1B
+dims, decode (`T=1`) and prefill (`T=128`), and fails if any median is > 10% slower than `bench/kernels-baseline.json`;
+`make bench-baseline` rewrites the baseline. No criterion: CUDA events are what we need and it would be a new dependency.
+
+Method: buffers are allocated before timing; each sample queues a ~1 ms filler GEMM, then CUDA events around `reps`
+back-to-back launches (sized to ~300 µs), so host launch latency is hidden but inter-kernel gaps are included.
+Median of 101 samples after warmup and a 0.5 s clock ramp. Weights and the read KV span rotate over ≥ 160 MiB of copies so
+they come from DRAM, as in a real 16-layer pass; activations are deliberately L2-resident (as they are in a pass),
+which is why some prefill elementwise kernels exceed the DRAM roofline. Reruns on an idle GPU agree within ~2%.
+
+Initial baseline (RTX 4070, driver 620.70.06), µs; % = of 504 GB/s, or of the 58.3 TFLOP/s FP16 spec peak for
+prefill GEMMs:
+
+| kernel | T=1 | % | T=128 | % |
+|---|---:|---:|---:|---:|
+| embedding | 3.25 | 1 | 4.24 | 49 |
+| rmsnorm | 3.17 | 1 | 3.57 | 59 |
+| rope | 2.66 | 1 | 3.07 | 87 |
+| kv_append | 1.68 | 0 | 1.84 | 56 |
+| silu_mul | 1.42 | 7 | 8.72 | L2 |
+| add | 1.30 | 2 | 2.46 | L2 |
+| attention, ctx 512 / 2048 / 8192 (A-01) | 7.16 / 14.0 / 43.3 | 29 / 60 / 77 | 6.99 (ctx 128) | 37 (17% FP16 peak) |
+| gemm qkv / o / gate_up / down | 29.7 / 20.5 / 146 / 74.8 | 84 / 81 / 92 / 89 | 46.2 / 28.3 / 187 / 119 | 60 / 64 / 78 / 61 |
+| lm_head (FP32 out) | 1113 | 94 | 1394 | 83 |
+
+Before A-01 attention was 79.5 / 311 / 1231 µs (3% of bandwidth) at decode and 178 µs at prefill: 32 blocks on 46 SMs,
+one thread per key walking 64 elements serially, 2 threads per output dim in P·V, and every KV head read by 4 blocks.
+
+Decode at ctx 2048 now sums to ≈ 16 × (271 GEMM + 14 attention + 15 small) µs + 1113 µs ≈ 5.9 ms/token, vs the 4.9 ms
+roofline. Decode attention has a ~4 µs fixed cost per call (launch gap, DRAM latency ramp, split merge; ctx 512 is
+29% of bandwidth for that reason) and streams at ≈ 430 GB/s marginally. The decode GEMMs are within 6–19% of
+bandwidth. The small kernels are launch-bound (~1.3–3.3 µs each, ~10 per layer) and call for fusion and CUDA graphs:
+≈ 16 × 15 µs ≈ 0.25 ms/token. Remaining gap to the roofline at ctx 2048: GEMM shortfall ≈ 0.5 ms, small kernels
+≈ 0.25 ms, attention ≈ 0.1 ms (its fixed cost).
