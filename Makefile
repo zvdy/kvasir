@@ -1,4 +1,4 @@
-.PHONY: build fmt fmt-check lint test-cpu test-gpu kernels deny doc ci ci-local doctor clean
+.PHONY: build build-gpu-tests fmt fmt-check lint test-cpu test-gpu kernels deny doc ci ci-local check-agent-pr doctor clean
 
 CARGO ?= cargo
 
@@ -18,6 +18,9 @@ lint:
 test-cpu:
 	$(CARGO) test --workspace
 
+build-gpu-tests:
+	$(CARGO) test --workspace --release --features gpu-tests --no-run
+
 test-gpu:
 	$(CARGO) test --workspace --release --features gpu-tests -- --test-threads=1
 
@@ -30,9 +33,12 @@ deny:
 doc:
 	RUSTDOCFLAGS=-Dwarnings $(CARGO) doc --workspace --no-deps
 
-ci: fmt-check lint test-cpu deny doc
+ci: fmt-check lint test-cpu build-gpu-tests deny doc
 
 ci-local: ci test-gpu
+
+check-agent-pr:
+	@scripts/check-agent-pr.sh
 
 doctor:
 	@scripts/doctor.sh

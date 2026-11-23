@@ -13,11 +13,16 @@
 
 ## GPU tests
 
-<!-- GPU model and driver from `make doctor`; GitHub CI cannot run these -->
+<!-- GitHub CI has no GPU (ADR 0006). GPU model/driver from `make doctor`, then the `test result:` lines of `make test-gpu`.
+Agent PRs must also have them in the run log; the `agent-pr` check enforces it. -->
+
+```
+```
 
 ## Checklist
 
 - [ ] `make ci-local` passes on a GPU machine
+- [ ] Required GitHub checks green: `ci-pass`, `dco`, `agent-pr`
 - [ ] No test tolerance loosened, no test removed or ignored
 - [ ] DESIGN.md, `.agent/backlog.yaml` and CHANGELOG.md updated where status changed
 - [ ] New ADR if a decision in `docs/adr/` is overturned
