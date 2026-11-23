@@ -30,6 +30,12 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
   prefill 128 tokens and decode at ctx 128/512/2048 (wall and device time, % of the `decode_bytes` roofline),
   compared against `bench/forward-baseline.json` (> 10% regression fails). Decode: 5.67–5.83 ms/token (171–176
   tok/s, 84–86% of roofline); prefill 128 tokens: 7.65 ms (I-01).
+- Real-model logit test `engine/tests/logits.rs` (features `gpu-tests,model-tests`, `make test-model`, not in
+  `ci-local`): prefill, teacher-forced decode and free-running greedy vs the `make ref` HF output, thresholds from
+  DESIGN.md §6; fails with a pointer to `make ref` when `ref/out` or the weights are missing. Currently fails on
+  reference near-ties (logit error is below the HF-FP16 floor); S1-07 is blocked pending a decision (DESIGN §6).
+- Real Llama 3.2 1B weights in `models/Llama-3.2-1B` (`ENV-weights` done; mirror `unsloth/Llama-3.2-1B`, sha256
+  identical to Meta's). `make lint` now also checks the `model-tests` feature.
 
 ### Changed
 

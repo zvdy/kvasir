@@ -5,15 +5,18 @@
 tasks:
   - id: ENV-weights
     title: Llama 3.2 1B weights present in models/Llama-3.2-1B
-    status: blocked
+    status: done
     depends_on: []
     files: []
     acceptance:
       - test -f models/Llama-3.2-1B/model.safetensors
     notes: >
-      Human action: `hf auth login` with an account approved for meta-llama/Llama-3.2-1B, then
-      `hf download meta-llama/Llama-3.2-1B --local-dir models/Llama-3.2-1B`. Agents mark this done
-      when `make doctor` reports weights=ok.
+      Done 2026-11-23 (make doctor: weights=ok). model.safetensors comes from the ungated mirror unsloth/Llama-3.2-1B
+      (downloaded with the maintainer's approval); its sha256
+      68a2e4be76fa709455a60272fba8e512c02d81c46e6c671cc9449e374fd6809a is identical to meta-llama/Llama-3.2-1B's.
+      The mirror's tokenizer.json differs in bytes from Meta's (unverified); the S1-07 logit test compares on the token
+      ids in ref/out/meta.json, so it is unaffected. Canonical route for a fresh checkout: `hf auth login` with an
+      approved account, then `hf download meta-llama/Llama-3.2-1B --local-dir models/Llama-3.2-1B`.
 
   - id: S1-01
     title: Workspace of preallocated activation buffers
@@ -83,7 +86,7 @@ tasks:
 
   - id: S1-07
     title: Logit-matching integration test
-    status: todo
+    status: blocked
     depends_on: [S1-03, S1-06, ENV-weights]
     files: [engine/tests/logits.rs, engine/Cargo.toml, Makefile]
     acceptance:
@@ -92,6 +95,12 @@ tasks:
     notes: >
       Thresholds exactly as DESIGN §6, calibrated from the HF-FP16 floor. New feature `model-tests`;
       add `make test-model`. Not part of `ci-local` until weights are routinely present.
+      Blocked 2026-11-23 (draft PR, needs a human decision on DESIGN §6): logit error is at the HF-FP16 floor
+      (prefill max 0.0210 vs floor 0.0256, decode max 0.0168 vs floor 0.0191, mean 0.0023/0.0021) and top-1 agrees
+      at 35/35 prefill positions, but three discrete criteria fail on near-ties of the reference prompt: decode step 1
+      has a reference top-2 margin of 0.0027 (kvasir prefers the runner-up by 0.0005), so decode top-1 is 15/16 and
+      free-running greedy diverges at token 2; 6/35 prefill positions have margin < 0.05, above the 1% cap.
+      See .agent/runs/2026-11-23-S1-07.md and DESIGN §6 "Measured".
 
   - id: S1-08
     title: Decode throughput benchmark vs roofline
