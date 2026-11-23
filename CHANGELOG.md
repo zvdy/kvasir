@@ -10,6 +10,8 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
 - Agent maintenance harness: `AGENTS.md`, `.agent/backlog.yaml`, `/maintain` skill, `reviewer` subagent, `make doctor`.
 - `make ci` / `make ci-local` gates; GPU tests gated behind the `gpu-tests` feature.
 - Apache-2.0 license, governance docs, CI (CUDA container build, cargo-deny, DCO, OpenSSF Scorecard), ADRs.
+- Kernel microbenchmarks (`make bench`) at Llama 3.2 1B decode/prefill shapes, compared against
+  `bench/kernels-baseline.json` (fails on > 10% regression); `make bench-baseline` rewrites it.
 
 ### Changed
 

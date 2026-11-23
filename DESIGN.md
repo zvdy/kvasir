@@ -24,6 +24,7 @@ engine/
   src/sampling.rs     greedy / temperature / top-p on host               [not written yet]
   src/bin/kvasir.rs   `kvasir generate --model <dir> --prompt ...`       [not written yet]
 engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint)
+engine/benches/       kernels.rs: per-kernel microbenchmarks vs bench/kernels-baseline.json (`make bench`)
 tests/ , ref/         logit-matching test and HF reference dumper        [not written yet]
 ```
 
@@ -140,4 +141,38 @@ are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong in
 | 8 kernels + CPU-reference tests, GEMM test | done, 16/16 passing |
 | config, RoPE table, weight loader | done; loader tested on a synthetic BF16 checkpoint (exact fused-layout check) |
 | real Llama 3.2 1B weights | **missing**: gated repo, backlog `ENV-weights` |
+| kernel microbenchmarks + stored baseline (`make bench`, H-01) | done; numbers in §8 |
 | forward pass, KV cache, sampling, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-01 … S1-08) |
+
+## 8. Kernel microbenchmarks
+
+`make bench` (`engine/benches/kernels.rs`, `harness = false`, needs `gpu-tests`) times every kernel at Llama 3.2 1B
+dims, decode (`T=1`) and prefill (`T=128`), and fails if any median is > 10% slower than `bench/kernels-baseline.json`;
+`make bench-baseline` rewrites the baseline. No criterion: CUDA events are what we need and it would be a new dependency.
+
+Method: buffers are allocated before timing; each sample queues a ~1 ms filler GEMM, then CUDA events around `reps`
+back-to-back launches (sized to ~300 µs), so host launch latency is hidden but inter-kernel gaps are included.
+Median of 101 samples after warmup and a 0.5 s clock ramp. Weights and the read KV span rotate over ≥ 160 MiB of copies so
+they come from DRAM, as in a real 16-layer pass; activations are deliberately L2-resident (as they are in a pass),
+which is why some prefill elementwise kernels exceed the DRAM roofline. Reruns on an idle GPU agree within ~2%.
+
+Initial baseline (RTX 4070, driver 620.70.06), µs; % = of 504 GB/s, or of the 58.3 TFLOP/s FP16 spec peak for
+prefill GEMMs:
+
+| kernel | T=1 | % | T=128 | % |
+|---|---:|---:|---:|---:|
+| embedding | 3.25 | 1 | 4.24 | 49 |
+| rmsnorm | 3.17 | 1 | 3.57 | 59 |
+| rope | 2.66 | 1 | 3.07 | 87 |
+| kv_append | 1.68 | 0 | 1.84 | 56 |
+| silu_mul | 1.42 | 7 | 8.72 | L2 |
+| add | 1.30 | 2 | 2.46 | L2 |
+| attention, ctx 512 / 2048 / 8192 | 79.5 / 311 / 1231 | 3 | 178 (ctx 128) | 1 |
+| gemm qkv / o / gate_up / down | 29.7 / 20.5 / 146 / 74.8 | 84 / 81 / 92 / 89 | 46.2 / 28.3 / 187 / 119 | 60 / 64 / 78 / 61 |
+| lm_head (FP32 out) | 1113 | 94 | 1394 | 83 |
+
+Decode at ctx 2048 sums to ≈ 16 × (271 GEMM + 311 attention + 15 small) µs + 1113 µs ≈ 10.7 ms/token, vs the 4.9 ms
+roofline. Attention is the first target: at decode it runs 32 blocks on 46 SMs, each thread walks one key's 64
+elements serially (uncoalesced), P·V gives each output dim only 2 threads that each walk half the keys, and every KV
+head is read by 4 blocks. The decode GEMMs are within 6–19% of bandwidth. The small kernels are launch-bound
+(~1.3–3.3 µs each, ~10 per layer) and call for fusion and CUDA graphs.

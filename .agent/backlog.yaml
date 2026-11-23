@@ -106,11 +106,11 @@ tasks:
 
   - id: H-01
     title: Kernel microbenchmarks with stored baseline
-    status: todo
+    status: done
     depends_on: []
     files: [engine/benches/, engine/Cargo.toml, Makefile, bench/]
     acceptance:
       - make bench
     notes: >
-      Criterion benches for each kernel at Llama dims behind the gpu-tests feature. `make bench` compares
+      Benches for each kernel at Llama dims behind the gpu-tests feature (self-contained harness, no criterion). `make bench` compares
       against bench/kernels-baseline.json and fails on > 10% regression.
