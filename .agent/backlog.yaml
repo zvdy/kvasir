@@ -30,7 +30,7 @@ tasks:
     title: Contiguous KvCache
     status: todo
     depends_on: []
-    files: [engine/src/kv/mod.rs, engine/tests/kv.rs, engine/Cargo.toml]
+    files: [engine/src/kv/mod.rs, engine/src/lib.rs, engine/tests/kv.rs, engine/Cargo.toml]
     acceptance:
       - cargo test --release --features gpu-tests --test kv
     notes: >
@@ -103,6 +103,19 @@ tasks:
     notes: >
       `kvasir bench` reports prefill and decode tok/s and % of the roofline from Weights::decode_bytes().
       Commit bench/baseline.json; later runs flag regressions > 5%.
+
+  - id: S1-09
+    title: Batch-1 decode comparison against llama.cpp and vLLM
+    status: todo
+    depends_on: [S1-08]
+    files: [bench/compare.md, bench/compare.sh, Makefile]
+    acceptance:
+      - bash -n bench/compare.sh
+    notes: >
+      Same model (Llama 3.2 1B), FP16, same RTX 4070, batch 1, 128-token prompt, 256 generated tokens, greedy.
+      `make compare` runs kvasir bench, llama.cpp `llama-bench` (F16 GGUF) and vLLM's offline throughput script when
+      each is installed, skipping missing ones with a message. bench/compare.md records tok/s, % of roofline and the
+      exact versions/commands. This is the scoreboard for "beat llama.cpp / vLLM".
 
   - id: H-01
     title: Kernel microbenchmarks with stored baseline
