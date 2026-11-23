@@ -114,3 +114,17 @@ tasks:
     notes: >
       Benches for each kernel at Llama dims behind the gpu-tests feature (self-contained harness, no criterion). `make bench` compares
       against bench/kernels-baseline.json and fails on > 10% regression.
+
+  - id: A-01
+    title: Flash-decoding attention kernel
+    status: done
+    depends_on: [H-01]
+    files: [engine/kernels/attention.cu, engine/kernels/common.cuh, engine/src/gpu/kernels.rs, engine/tests/kernels.rs,
+            bench/kernels-baseline.json, DESIGN.md]
+    acceptance:
+      - cargo test --release --features gpu-tests --test kernels
+      - make bench
+    notes: >
+      Decode split-K over context with GQA-shared K/V loads and online softmax; tiled causal prefill. Remove the
+      ~11.9k kv-length cap. Target decode ctx 2048 >= 60% of bandwidth, prefill >= 10x. Wrapper gains a `scratch`
+      parameter (`attention_scratch_len`); callers outside this branch (KvCache::attention) adapt on merge.

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{CudaEvent, CudaSlice};
 use half::f16;
+use kvasir::gpu::kernels::attention_scratch_len;
 use kvasir::gpu::{gemm, Gpu};
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -200,6 +201,7 @@ fn attention_case(b: &mut Bench, name: &str, t: usize, pos0: usize) -> Res<()> {
     let vcs = b.copies(per_layer, 2 * per_layer * 2)?;
     let qkv = b.alloc(t * QKV)?;
     let mut out = b.alloc(t * N_Q * HEAD_DIM)?;
+    let mut scratch = b.gpu.stream.alloc_zeros::<f32>(attention_scratch_len(N_Q, HEAD_DIM))?;
     let bytes = 2 * N_KV * len * HEAD_DIM * 2 + 2 * t * N_Q * HEAD_DIM * 2;
     let flops = 4 * N_Q * HEAD_DIM * (t * pos0 + t * (t + 1) / 2);
     b.run(name, bytes, flops, |g, i| {
@@ -209,6 +211,7 @@ fn attention_case(b: &mut Bench, name: &str, t: usize, pos0: usize) -> Res<()> {
             &kcs[l].as_view(),
             &vcs[l].as_view(),
             &mut out.as_view_mut(),
+            &mut scratch.as_view_mut(),
             t,
             pos0,
             N_Q,

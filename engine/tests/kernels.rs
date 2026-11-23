@@ -1,4 +1,6 @@
+use cudarc::driver::CudaSlice;
 use half::{bf16, f16};
+use kvasir::gpu::kernels::attention_scratch_len;
 use kvasir::gpu::{gemm, Gpu};
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 
@@ -235,6 +237,21 @@ fn kv_append_places_k_and_v() {
 
 fn attention_case(n_q: usize, n_kv: usize, hd: usize, t: usize, pos0: usize, max_seq: usize) {
     let g = gpu();
+    let mut dscratch = g.stream.alloc_zeros::<f32>(attention_scratch_len(n_q, hd)).unwrap();
+    attention_check(&g, &mut dscratch, n_q, n_kv, hd, t, pos0, max_seq);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_check(
+    g: &Gpu,
+    dscratch: &mut CudaSlice<f32>,
+    n_q: usize,
+    n_kv: usize,
+    hd: usize,
+    t: usize,
+    pos0: usize,
+    max_seq: usize,
+) {
     let mut rng = StdRng::seed_from_u64(100 + (t * 31 + pos0) as u64);
     let stride = (n_q + 2 * n_kv) * hd;
     let qkv = rand_f16(&mut rng, t * stride, 2.0);
@@ -251,6 +268,7 @@ fn attention_case(n_q: usize, n_kv: usize, hd: usize, t: usize, pos0: usize, max
         &dk.as_view(),
         &dv.as_view(),
         &mut dout.as_view_mut(),
+        &mut dscratch.as_view_mut(),
         t,
         pos0,
         n_q,
@@ -313,6 +331,61 @@ fn attention_llama_dims_long_context() {
 #[test]
 fn attention_head_dim_128() {
     attention_case(4, 2, 128, 2, 20, 64);
+}
+
+#[test]
+fn attention_decode_ctx1() {
+    attention_case(32, 8, 64, 1, 0, 16);
+}
+
+#[test]
+fn attention_decode_split_lengths() {
+    for kv_len in [63, 64, 65, 200, 1000, 2049, 8191] {
+        attention_case(32, 8, 64, 1, kv_len - 1, 8192);
+    }
+}
+
+#[test]
+fn attention_decode_reuses_scratch() {
+    let g = gpu();
+    let mut dscratch = g.stream.alloc_zeros::<f32>(attention_scratch_len(32, 64)).unwrap();
+    for kv_len in [3000, 700, 5000, 1, 4096] {
+        attention_check(&g, &mut dscratch, 32, 8, 64, 1, kv_len - 1, 8192);
+    }
+}
+
+#[test]
+fn attention_decode_beyond_old_smem_cap() {
+    attention_case(32, 8, 64, 1, 16383, 16384);
+}
+
+#[test]
+fn attention_decode_more_splits_than_cap() {
+    attention_case(32, 8, 64, 1, 40000, 40001);
+}
+
+#[test]
+fn attention_decode_head_dim_128_groups() {
+    attention_case(4, 4, 128, 1, 300, 512);
+    attention_case(16, 2, 128, 1, 777, 1024);
+}
+
+#[test]
+fn attention_prefill_llama_dims() {
+    attention_case(32, 8, 64, 128, 0, 128);
+    attention_case(32, 8, 64, 77, 0, 128);
+}
+
+#[test]
+fn attention_prefill_long_prefix() {
+    attention_case(32, 8, 64, 37, 1000, 1100);
+}
+
+#[test]
+fn attention_prefill_groups() {
+    attention_case(8, 8, 64, 70, 3, 80);
+    attention_case(16, 2, 64, 21, 50, 80);
+    attention_case(8, 2, 128, 45, 30, 80);
 }
 
 fn linear_reference(x: &[f32], w: &[f32], t: usize, i: usize, o: usize) -> Vec<f32> {
