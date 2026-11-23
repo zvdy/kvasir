@@ -1,4 +1,4 @@
-.PHONY: build build-gpu-tests fmt fmt-check lint test-cpu test-gpu kernels deny doc ci ci-local check-agent-pr doctor clean bench bench-kernels bench-forward bench-baseline ref
+.PHONY: build build-gpu-tests fmt fmt-check lint test-cpu test-gpu kernels deny doc ci ci-local check-agent-pr doctor clean bench bench-kernels bench-forward bench-baseline ref test-model
 
 CARGO ?= cargo
 REF_MODEL ?= models/Llama-3.2-1B
@@ -16,7 +16,7 @@ fmt-check:
 
 lint:
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
-	$(CARGO) clippy --workspace --all-targets --features gpu-tests -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --features gpu-tests,model-tests -- -D warnings
 
 test-cpu:
 	$(CARGO) test --workspace
@@ -26,6 +26,9 @@ build-gpu-tests:
 
 test-gpu:
 	$(CARGO) test --workspace --release --features gpu-tests -- --test-threads=1
+
+test-model:
+	$(CARGO) test --release --features gpu-tests,model-tests --test logits -- --nocapture
 
 kernels:
 	$(CARGO) test --release --features gpu-tests --test kernels -- --nocapture --test-threads=1

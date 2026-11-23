@@ -257,7 +257,7 @@ activation. Metric: max |logit error| over all rows.
   **`TOL_HEAD_ONLY = 1e-3`**. A reset followed by the same call must be bit-identical.
 - Top-1 must agree with the exact reference at every position whose reference top-2 margin exceeds 2·TOL.
 
-**Real-model logit test (S1-06/S1-07, not yet built).**
+**Real-model logit test (S1-06/S1-07).**
 
 - `ref/dump_logits.py`: HF `LlamaForCausalLM`, FP32, eager attention → prompt ids, prefill logits (all positions),
   greedy tokens (48 steps), decode logits for the first 16 steps (teacher-forced). Also an HF-**FP16** run, giving the
@@ -272,6 +272,22 @@ activation. Metric: max |logit error| over all rows.
 - `tests/logits.rs` thresholds are *calibrated from that floor* rather than guessed: max abs err ≤ 2× the HF-FP16 floor
   and ≤ 1.0 absolute, mean abs err ≤ 0.05; top-1 agreement 100% on decode steps and ≥ 99% over prefill positions
   (excluding positions whose reference top-2 margin < 0.05, reported and capped at 1%); ≥ 32 greedy tokens identical.
+- `tests/logits.rs` (feature `model-tests`, `make test-model`, not in `ci-local`) reads `ref/out/` and
+  `models/Llama-3.2-1B/` and fails with a pointer to `make ref` when either is missing. Max-abs threshold per part =
+  min(2 × that part's floor, 1.0). Weights: `model.safetensors` from the mirror `unsloth/Llama-3.2-1B`, sha256
+  `68a2e4be…6809a`, identical to `meta-llama/Llama-3.2-1B`'s; the mirror's `tokenizer.json` differs in bytes from
+  Meta's (unverified), which does not affect the test because it feeds the token ids from `meta.json`.
+- **Measured (2026-11-23, 35-token default prompt, torch 2.14.1+cpu / transformers 5.22.2).** HF-FP16 floor: prefill
+  max 0.0256 / mean 0.00254, decode max 0.0191 / mean 0.00265, top-1 100% both. kvasir: prefill max **0.0210**
+  (≤ 0.0512) / mean **0.00225**; decode (teacher-forced, 16 steps) max **0.0168** (≤ 0.0381) / mean **0.00211**;
+  prefill top-1 **29/29** on non-excluded positions (35/35 including excluded). Failing, all on reference near-ties:
+  decode top-1 **15/16** (step 1: reference margin 0.0027 between ids 4358 and 7664, kvasir has 7664 ahead by
+  0.0005; HF-FP16 happens to keep 4358); free-running greedy identical prefix **2/48** (the same tie, then a
+  different but coherent continuation); prefill positions with margin < 0.05 **6/35** (17%, cap 1%). The logit
+  errors are below the FP16 floor, so the top-1/greedy/exclusion criteria are not attainable for this prompt by any
+  FP16 engine without luck: a 0.0027 margin is ≈ 1/7 of the floor. **S1-07 is blocked** on a human decision about
+  these criteria (e.g. exempt decode steps / greedy positions whose reference margin is below the floor, or define the
+  exclusion cap in positions rather than 1% of 35); tolerances were not changed.
 - Roofline: decode bytes = `Weights::decode_bytes()` (all layer matrices + norms + tied head ≈ 2.47 GB) / 504 GB/s
   ≈ 4.9 ms/token ≈ 204 tok/s upper bound (KV reads add < 1% at short context).
 
@@ -283,7 +299,7 @@ activation. Metric: max |logit error| over all rows.
 | 8 kernels + CPU-reference tests, GEMM test | done, 25/25 passing |
 | config, RoPE table, weight loader | done; loader tested on a synthetic BF16 checkpoint (exact fused-layout check) |
 | host sampling (greedy, temperature, top-p) | done; seeded, partial-select nucleus, 12 CPU tests |
-| real Llama 3.2 1B weights | **missing**: gated repo, backlog `ENV-weights` |
+| real Llama 3.2 1B weights | present (`ENV-weights` done): mirror `unsloth/Llama-3.2-1B`, `model.safetensors` sha256 `68a2e4be76fa709455a60272fba8e512c02d81c46e6c671cc9449e374fd6809a` = `meta-llama/Llama-3.2-1B`'s; mirror tokenizer.json unverified (§6) |
 | workspace (activation buffers, ids upload, logits D2H into a reused host buffer) | done (S1-01); CPU size tests + GPU alloc/round-trip test |
 | KV cache (`KvCache`) | done (S1-02); `tests/kv.rs` (6 GPU tests: exact placement at several `pos0`, overflow errors, attention via layer view) |
 | forward pass (`Llama::forward`, prefill / chunked prefill / decode) | done (S1-03); `tests/forward.rs` (6 GPU tests vs f64 CPU reference on a synthetic model, thresholds §6) |
@@ -292,8 +308,9 @@ activation. Metric: max |logit error| over all rows.
 | attention wired into the forward pass, full-size forward bench (I-01) | done; decode 5.84 ms/token at ctx 2048 (84% of roofline), prefill 128 tok in 7.6 ms; §8 |
 | hand-written decode GEMV with fused RMSNorm / SwiGLU / residual add (P-01, ADR 0007) | done; 6 CPU-reference tests (real + odd shapes, shape errors); decode 5.69 ms/token at ctx 2048 (86% of roofline, was 84%) |
 | CLI `kvasir generate` (streamed output, EOS list, prefill/decode tok/s, `--json`) | done (S1-05); `tests/cli.rs` (6 GPU tests running the binary on a synthetic model + in-test WordLevel tokenizer) |
-| HF reference dumper (`ref/dump_logits.py`, `make ref`) | done (S1-06); validated on a tiny random Llama, awaits real weights |
-| logit test, perf report | ordered in `.agent/backlog.yaml` (S1-07, S1-08) |
+| HF reference dumper (`ref/dump_logits.py`, `make ref`) | done (S1-06); run on the real weights, HF-FP16 floor prefill 0.0256 / decode 0.0191 max abs |
+| real-model logit test (`tests/logits.rs`, `make test-model`) | **blocked** (S1-07): logit error below the HF-FP16 floor, but decode top-1 15/16, greedy prefix 2/48 and 6/35 low-margin prefill positions fail on reference near-ties; §6 "Measured" |
+| perf report | ordered in `.agent/backlog.yaml` (S1-08) |
 
 ## 8. Benchmarks
 
