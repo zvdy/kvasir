@@ -7,6 +7,8 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
 
 ### Added
 
+- Host sampling (`engine/src/sampling.rs`): greedy, temperature and top-p with a seeded `StdRng`; no per-step heap
+  allocation, nucleus found by partial selection instead of a full vocab sort.
 - Agent maintenance harness: `AGENTS.md`, `.agent/backlog.yaml`, `/maintain` skill, `reviewer` subagent, `make doctor`.
 - `make ci` / `make ci-local` gates; GPU tests gated behind the `gpu-tests` feature.
 - Apache-2.0 license, governance docs, CI (CUDA container build, cargo-deny, DCO, OpenSSF Scorecard), ADRs.

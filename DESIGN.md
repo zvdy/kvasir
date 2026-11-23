@@ -21,7 +21,7 @@ engine/
     llama.rs          forward pass (prefill / decode)                    [not written yet]
     workspace.rs      preallocated activation buffers                    [not written yet]
   src/kv/             contiguous KV cache                                [not written yet]
-  src/sampling.rs     greedy / temperature / top-p on host               [not written yet]
+  src/sampling.rs     greedy / temperature / top-p on host (Sampler, reused scratch, seeded StdRng)
   src/bin/kvasir.rs   `kvasir generate --model <dir> --prompt ...`       [not written yet]
 engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint)
 tests/ , ref/         logit-matching test and HF reference dumper        [not written yet]
@@ -139,5 +139,6 @@ are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong in
 | gpu wrappers, build.rs | done |
 | 8 kernels + CPU-reference tests, GEMM test | done, 16/16 passing |
 | config, RoPE table, weight loader | done; loader tested on a synthetic BF16 checkpoint (exact fused-layout check) |
+| host sampling (greedy, temperature, top-p) | done; seeded, partial-select nucleus, 12 CPU tests |
 | real Llama 3.2 1B weights | **missing**: gated repo, backlog `ENV-weights` |
-| forward pass, KV cache, sampling, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-01 … S1-08) |
+| forward pass, KV cache, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-01 … S1-08) |

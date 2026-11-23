@@ -52,7 +52,7 @@ tasks:
 
   - id: S1-04
     title: Host sampling (greedy, temperature, top-p)
-    status: todo
+    status: done
     depends_on: []
     files: [engine/src/sampling.rs]
     acceptance:
