@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaStream, CudaView, CudaViewMut, DevicePtr, LaunchConfig, PushKernelArg,
+};
 use half::{bf16, f16};
 
 use super::device::{load_ptx, Gpu};
@@ -42,6 +44,29 @@ fn att_variant(head_dim: usize, group: usize) -> Option<usize> {
 /// per-head counters). Allocate it zeroed; the kernel leaves the counters at zero after every call.
 pub fn attention_scratch_len(n_q: usize, head_dim: usize) -> usize {
     n_q + ATT_DEC_MAX_SPLITS * n_q * (head_dim + 2)
+}
+
+/// Checks that [`Gpu::attention`] has a compiled variant for these head counts; returns the GQA group size.
+pub fn check_attention_dims(n_q: usize, n_kv: usize, head_dim: usize) -> Result<usize> {
+    ensure_shape!(
+        n_kv > 0 && n_q.is_multiple_of(n_kv),
+        "attention: n_q {n_q} not a multiple of n_kv {n_kv}"
+    );
+    let group = n_q / n_kv;
+    ensure_shape!(
+        att_variant(head_dim, group).is_some(),
+        "attention: unsupported head_dim {head_dim} / group {group} (want {ATT_HEAD_DIMS:?} / {ATT_GROUPS:?})"
+    );
+    Ok(group)
+}
+
+fn check_aligned<T>(v: &impl DevicePtr<T>, stream: &CudaStream, align: u64, what: &str) -> Result<()> {
+    let (ptr, _sync) = v.device_ptr(stream);
+    ensure_shape!(
+        ptr.is_multiple_of(align),
+        "attention: {what} at {ptr:#x} is not {align}-byte aligned"
+    );
+    Ok(())
 }
 
 fn decode_split(kv_len: usize) -> (usize, usize) {
@@ -342,16 +367,9 @@ impl Gpu {
         max_seq: usize,
     ) -> Result<()> {
         let stride = (n_q + 2 * n_kv) * head_dim;
-        ensure_shape!(
-            n_kv > 0 && n_q.is_multiple_of(n_kv),
-            "attention: n_q {n_q} not a multiple of n_kv {n_kv}"
-        );
-        let group = n_q / n_kv;
-        let Some(variant) = att_variant(head_dim, group) else {
-            return Err(KvasirError::Shape(format!(
-                "attention: unsupported head_dim {head_dim} / group {group} (want {ATT_HEAD_DIMS:?} / {ATT_GROUPS:?})"
-            )));
-        };
+        let group = check_attention_dims(n_q, n_kv, head_dim)?;
+        let variant = att_variant(head_dim, group)
+            .ok_or_else(|| KvasirError::Shape(format!("attention: no variant for {head_dim}/{group}")))?;
         ensure_shape!(t > 0, "attention: t must be > 0");
         ensure_shape!(
             qkv.len() == t * stride,
@@ -379,6 +397,11 @@ impl Gpu {
             scratch.len(),
             attention_scratch_len(n_q, head_dim)
         );
+        check_aligned(qkv, &self.stream, 16, "qkv")?;
+        check_aligned(kc, &self.stream, 16, "kc")?;
+        check_aligned(vc, &self.stream, 16, "vc")?;
+        check_aligned(out, &self.stream, 4, "out")?;
+        check_aligned(scratch, &self.stream, 4, "scratch")?;
         let (p, nq, ms, rs) = (
             i32_of(pos0, "pos0")?,
             i32_of(n_q, "n_q")?,

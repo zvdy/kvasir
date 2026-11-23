@@ -1,4 +1,5 @@
 use half::f16;
+use kvasir::gpu::kernels::attention_scratch_len;
 use kvasir::gpu::Gpu;
 use kvasir::kv::KvCache;
 use kvasir::model::LlamaConfig;
@@ -133,12 +134,21 @@ fn overflow_and_bad_layer_are_errors() {
 
     let qkv = g.stream.clone_htod(&rand_f16(&mut rng, 2 * STRIDE, 2.0)).unwrap();
     let mut out = g.stream.alloc_zeros::<f16>(2 * N_Q * HD).unwrap();
+    let mut scratch = g.stream.alloc_zeros::<f32>(attention_scratch_len(N_Q, HD)).unwrap();
     assert!(matches!(
         cache.append(&g, 0, &qkv.as_view(), 2, N_Q),
         Err(KvasirError::Shape(_))
     ));
     assert!(matches!(
-        cache.attention(&g, 0, &qkv.as_view(), &mut out.as_view_mut(), 2, N_Q),
+        cache.attention(
+            &g,
+            0,
+            &qkv.as_view(),
+            &mut out.as_view_mut(),
+            &mut scratch.as_view_mut(),
+            2,
+            N_Q
+        ),
         Err(KvasirError::Shape(_))
     ));
     assert!(cache.advance(2).is_err());
@@ -180,8 +190,17 @@ fn attention_reads_layer_view() {
     cache.append(&g, layer, &dqkv.as_view(), 1, N_Q).unwrap();
     mirror.append(layer, &qkv, 1, pos0);
     let mut dout = g.stream.alloc_zeros::<f16>(N_Q * HD).unwrap();
+    let mut scratch = g.stream.alloc_zeros::<f32>(attention_scratch_len(N_Q, HD)).unwrap();
     cache
-        .attention(&g, layer, &dqkv.as_view(), &mut dout.as_view_mut(), 1, N_Q)
+        .attention(
+            &g,
+            layer,
+            &dqkv.as_view(),
+            &mut dout.as_view_mut(),
+            &mut scratch.as_view_mut(),
+            1,
+            N_Q,
+        )
         .unwrap();
     let got: Vec<f32> = g.stream.clone_dtoh(&dout).unwrap().iter().map(|x| x.to_f32()).collect();
 
@@ -214,4 +233,40 @@ fn attention_reads_layer_view() {
             );
         }
     }
+}
+
+#[test]
+fn misaligned_views_are_errors() {
+    let g = gpu();
+    let mut rng = StdRng::seed_from_u64(25);
+    let mut cache = KvCache::new(&g, LAYERS, N_KV, MAX_SEQ, HD).unwrap();
+    let mut mirror = Mirror::new();
+    step(&g, &mut cache, &mut mirror, &mut rng, 3);
+
+    let qkv = g.stream.clone_htod(&rand_f16(&mut rng, STRIDE + 8, 2.0)).unwrap();
+    let mut out = g.stream.alloc_zeros::<f16>(N_Q * HD + 1).unwrap();
+    let mut scratch = g.stream.alloc_zeros::<f32>(attention_scratch_len(N_Q, HD)).unwrap();
+    for (q0, o0) in [(1, 0), (4, 0), (0, 1)] {
+        let res = cache.attention(
+            &g,
+            0,
+            &qkv.slice(q0..q0 + STRIDE),
+            &mut out.slice_mut(o0..o0 + N_Q * HD),
+            &mut scratch.as_view_mut(),
+            1,
+            N_Q,
+        );
+        assert!(matches!(res, Err(KvasirError::Shape(_))), "qkv+{q0} out+{o0}: {res:?}");
+    }
+    cache
+        .attention(
+            &g,
+            0,
+            &qkv.slice(8..8 + STRIDE),
+            &mut out.slice_mut(0..N_Q * HD),
+            &mut scratch.as_view_mut(),
+            1,
+            N_Q,
+        )
+        .unwrap();
 }

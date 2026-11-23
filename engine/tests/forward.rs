@@ -8,8 +8,8 @@ use rand::{rngs::StdRng, RngExt, SeedableRng};
 use safetensors::tensor::TensorView;
 use safetensors::Dtype;
 
-const CFG: &str = r#"{"hidden_size":64,"intermediate_size":128,"num_hidden_layers":2,"num_attention_heads":4,
-  "num_key_value_heads":2,"head_dim":16,"vocab_size":100,"rms_norm_eps":1e-5,"rope_theta":10000.0,
+const CFG: &str = r#"{"hidden_size":256,"intermediate_size":128,"num_hidden_layers":2,"num_attention_heads":4,
+  "num_key_value_heads":2,"head_dim":64,"vocab_size":100,"rms_norm_eps":1e-5,"rope_theta":10000.0,
   "max_position_embeddings":256,"tie_word_embeddings":true}"#;
 
 const MAX_SEQ: usize = 40;
@@ -68,7 +68,7 @@ fn write_checkpoint(name: &str, seed: u64) -> (PathBuf, HostModel) {
         (
             "model.embed_tokens.weight".into(),
             vec![v, h],
-            rand_bf16(&mut rng, v * h, -1.0, 1.0),
+            rand_bf16(&mut rng, v * h, -0.5, 0.5),
         ),
         ("model.norm.weight".into(), vec![h], rand_bf16(&mut rng, h, 0.5, 1.5)),
     ];
@@ -414,6 +414,14 @@ fn rejects_bad_limits() {
     let mut wrong_layers = cfg.clone();
     wrong_layers.num_layers = 3;
     assert!(Llama::new(&gpu, wrong_layers, load(), 16, 8, 1).is_err());
+    for (n_q, n_kv, hd) in [(8, 4, 32), (4, 3, 64), (32, 2, 8)] {
+        let mut c = cfg.clone();
+        (c.num_heads, c.num_kv_heads, c.head_dim) = (n_q, n_kv, hd);
+        assert!(
+            Llama::new(&gpu, c, load(), 16, 8, 1).is_err(),
+            "{n_q}/{n_kv}/{hd} accepted"
+        );
+    }
 
     let mut model = Llama::new(&gpu, cfg.clone(), load(), 16, 8, 2).unwrap();
     assert!(model.forward(&gpu, &[1, 2, 3], Logits::All).is_err());

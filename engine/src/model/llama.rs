@@ -4,11 +4,9 @@ use super::workspace::{Workspace, WorkspaceDims};
 use crate::ensure_shape;
 use crate::error::Result;
 use crate::gpu::gemm::{linear_f16, linear_f32};
+use crate::gpu::kernels::check_attention_dims;
 use crate::gpu::Gpu;
 use crate::kv::KvCache;
-
-// Mirrors the `attention` wrapper's shared-memory bound: (kv_len + head_dim + 128) FP32 ≤ 48 KiB.
-const ATTENTION_SMEM_BYTES: usize = 48 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Logits {
@@ -38,10 +36,7 @@ impl Llama {
             weights.layers.len(),
             cfg.num_layers
         );
-        ensure_shape!(
-            (max_seq + cfg.head_dim + 128) * 4 <= ATTENTION_SMEM_BYTES,
-            "llama: max_seq {max_seq} exceeds the attention kernel's kv length limit"
-        );
+        check_attention_dims(cfg.num_heads, cfg.num_kv_heads, cfg.head_dim)?;
         ensure_shape!(
             max_tokens <= max_seq,
             "llama: max_tokens {max_tokens} exceeds max_seq {max_seq}"
@@ -148,6 +143,7 @@ impl Llama {
                 l,
                 &ws.qkv.row_view(0..t)?,
                 &mut ws.attn.row_view_mut(0..t)?,
+                &mut ws.attn_scratch.buf.as_view_mut(),
                 t,
                 n_q,
             )?;
