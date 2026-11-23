@@ -46,3 +46,7 @@ required-features = ["gpu-tests"]
 [[test]]
 name = "forward"
 required-features = ["gpu-tests"]
+
+[[test]]
+name = "cli"
+required-features = ["gpu-tests"]

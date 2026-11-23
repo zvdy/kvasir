@@ -39,8 +39,9 @@ impl Llama {
             cfg.num_layers
         );
         ensure_shape!(
-            (max_seq + cfg.head_dim + 128) * 4 <= ATTENTION_SMEM_BYTES,
-            "llama: max_seq {max_seq} exceeds the attention kernel's kv length limit"
+            max_seq <= Self::max_seq_limit(cfg.head_dim),
+            "llama: max_seq {max_seq} exceeds the attention kernel's kv length limit {}",
+            Self::max_seq_limit(cfg.head_dim)
         );
         ensure_shape!(
             max_tokens <= max_seq,
@@ -55,6 +56,10 @@ impl Llama {
             cache,
             ws,
         })
+    }
+
+    pub const fn max_seq_limit(head_dim: usize) -> usize {
+        (ATTENTION_SMEM_BYTES / 4).saturating_sub(head_dim + 128)
     }
 
     pub fn config(&self) -> &LlamaConfig {

@@ -13,7 +13,7 @@ An LLM inference engine written from scratch in Rust with hand-written CUDA kern
 | GPU wrappers, cuBLAS GEMM | done |
 | CUDA kernels (embedding, RMSNorm, RoPE, attention, SiLU·mul, KV append) with CPU-reference tests | done |
 | Config, RoPE table, safetensors loader | done |
-| Forward pass, KV cache, sampling, CLI | next |
+| Forward pass, KV cache, sampling, `kvasir generate` CLI | done (tested on a synthetic model) |
 | HF logit-matching test, tokens/sec vs roofline | next |
 
 Design, data layouts and numeric deviations from HF are in [DESIGN.md](DESIGN.md).
@@ -49,6 +49,18 @@ make ci         # fmt-check, clippy, CPU tests, cargo-deny, docs (what GitHub CI
 make ci-local   # ci + GPU tests (required before every PR)
 make kernels    # kernel tests with error magnitudes
 ```
+
+## Usage
+
+```
+cargo run --release -- generate --model models/Llama-3.2-1B --prompt "The capital of France is" \
+    --max-tokens 64 --seed 0                      # greedy
+cargo run --release -- generate --model models/Llama-3.2-1B --prompt "Once upon a time" \
+    --max-tokens 128 --seed 42 --temperature 0.8 --top-p 0.95 --json
+```
+
+Text streams to stdout; prompt/generated token counts and prefill/decode tok/s go to stderr (`--json`: one JSON line).
+`--ignore-eos` forces exactly `--max-tokens` tokens, `--prefill-chunk` sets the prompt tokens per forward call.
 
 ## Contributing and agent maintenance
 

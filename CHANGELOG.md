@@ -19,6 +19,9 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
 - `model::Llama`: forward pass over `Weights` + `KvCache` + `Workspace` for prefill, chunked prefill and decode;
   `forward(gpu, ids, Logits::Last | Logits::All)` returns FP32 logits without device allocation. `KvCache::from_config`
   now owns the RoPE cos/sin tables; `DeviceTensor::row_view(_mut)` give leading/ranged row views (S1-03).
+- `kvasir generate --model <dir> --prompt <text> --max-tokens N --seed S [--temperature T --top-p P]`: chunked
+  prefill, streamed output, stops at any EOS id from config/generation_config, prints prefill and decode tok/s to
+  stderr (`--json` for one JSON line, `--ignore-eos` for fixed-length runs). `Llama::max_seq_limit` (S1-05).
 
 ### Changed
 

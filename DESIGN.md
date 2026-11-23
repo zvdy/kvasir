@@ -22,7 +22,7 @@ engine/
     workspace.rs      Workspace: preallocated activations; WorkspaceDims = pure size math
   src/kv/             KvCache: contiguous K/V, per-layer views, length + bounds tracking
   src/sampling.rs     greedy / temperature / top-p on host (Sampler, reused scratch, seeded StdRng)
-  src/bin/kvasir.rs   `kvasir generate --model <dir> --prompt ...`       [not written yet]
+  src/bin/kvasir.rs   `kvasir generate`: tokenize, chunked prefill, decode loop, streamed text, tok/s on stderr
 engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint), workspace.rs, kv.rs (cache placement),
                       forward.rs (tiny model vs CPU f64 reference forward)
 tests/ , ref/         logit-matching test and HF reference dumper        [not written yet]
@@ -100,6 +100,19 @@ to the leading rows of `normed`) and the LM head GEMM into `logits`. All views a
 unchanged; `len` only advances after the last layer. `Llama::new` rejects `max_tokens > max_seq` and a `max_seq`
 above the attention kernel's shared-memory limit (`(max_seq + head_dim + 128)·4 B ≤ 48 KiB`, 12 096 for
 head_dim 64), so the limit surfaces at construction instead of mid-generation. `reset`/`truncate` rewind the cache.
+`Llama::max_seq_limit(head_dim)` exposes that bound.
+
+**Generation (`kvasir generate`).** The prompt is encoded with the tokenizer's post-processor (Llama 3 adds BOS
+128000); BOS is prepended only if the first id is not already BOS. EOS ids are the union of `config.json` and
+`generation_config.json` `eos_token_id` (number or list; tokenizer names as fallback), so instruct checkpoints stop
+on 128001/128008/128009. `max_seq = min(prompt + max_tokens − 1, max_position_embeddings, max_seq_limit)`,
+`max_tokens` (workspace) = `min(prefill_chunk, prompt)`, `max_head_rows = 1`. The prompt is fed in chunks with
+`Logits::Last`, then `forward(&[tok], Logits::Last) → Sampler::sample` until EOS, `--max-tokens` or a full cache.
+One untimed warm-up (one prefill chunk and one decode step, then `reset`) absorbs cuBLAS lazy init. Text is
+streamed by decoding the whole generated id list and printing the new suffix, held back while it ends in U+FFFD
+(partial UTF-8 byte tokens). Timers: prefill = prompt forward calls; decode = each decode `forward + sample` with
+`gpu.synchronize()` before the timer is read; decode tok/s = decode steps / decode time (the first token comes from
+prefill). Stats go to stderr (`--json`: one JSON line).
 
 ## 3. Kernels (naive, correct, validated against CPU before use)
 
@@ -196,4 +209,5 @@ activation. Metric: max |logit error| over all rows.
 | workspace (activation buffers, ids upload, logits D2H into a reused host buffer) | done (S1-01); CPU size tests + GPU alloc/round-trip test |
 | KV cache (`KvCache`) | done (S1-02); `tests/kv.rs` (6 GPU tests: exact placement at several `pos0`, overflow errors, attention via layer view) |
 | forward pass (`Llama::forward`, prefill / chunked prefill / decode) | done (S1-03); `tests/forward.rs` (6 GPU tests vs f64 CPU reference on a synthetic model, thresholds §6) |
-| CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-05 … S1-08) |
+| CLI `kvasir generate` (streamed output, EOS list, prefill/decode tok/s, `--json`) | done (S1-05); `tests/cli.rs` (6 GPU tests running the binary on a synthetic model + in-test WordLevel tokenizer) |
+| ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-06 … S1-08) |
