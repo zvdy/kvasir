@@ -1,6 +1,6 @@
 ---
 name: maintain
-description: Periodic maintenance run for kvasir. Checks the environment, keeps main green, picks exactly one backlog task, implements it on an agent/* branch and opens a PR. Use when the user types /maintain or asks for a maintenance run. `/maintain triage` only checks health and proposes work.
+description: Periodic maintenance run for kvasir. Checks the environment, keeps main green, picks a backlog task, implements it on an agent/* branch and opens a PR whose GitHub checks must go green. Use when the user types /maintain or asks for a maintenance run. `/maintain parallel` fans eligible non-overlapping tasks out to worktree subagents; `/maintain triage` only checks health and proposes work.
 ---
 
 # /maintain
@@ -20,8 +20,8 @@ git switch main && git pull --ff-only
 gh pr list --state open --search "head:agent/" --json number,title,headRefName
 ```
 
-If the working tree is dirty, stop and report. If an open `agent/*` PR exists, stop and report its number and title.
-Do not stack work on unmerged agent PRs.
+If the working tree is dirty, stop and report. Note the open `agent/*` PRs: a task whose `files` overlap one of them
+(ignoring the AGENTS.md bookkeeping files) is not eligible this run. Never branch from an unmerged agent branch.
 
 If `make doctor` reported `weights=ok` and `ENV-weights` is `blocked` in `.agent/backlog.yaml`, treat flipping it to
 `done` as part of this run's task (same PR).
@@ -37,7 +37,7 @@ Run `make ci-local` on main.
 Read `.agent/backlog.yaml`. Pick the **first** task in file order with `status: todo` whose `depends_on` are all `done`.
 If none, run **triage** (below) and stop. Set the task's `status: in_progress` locally.
 
-If the argument is `triage`, skip to triage now.
+If the argument is `triage`, skip to triage now. If it is `parallel`, go to **Parallel** below.
 
 ## 5. Implement
 
@@ -51,7 +51,8 @@ git switch -c agent/<task-id>
 
 ## 6. Gate
 
-Run `make fmt`, then `make ci-local`, then every `acceptance` command. On failure, fix and rerun, with at most **5** full
+Run `make fmt`, then `make ci-local`, then every `acceptance` command. Keep the `test result:` lines from `make test-gpu`
+for the run log; the `agent-pr` check rejects a run log without them. On failure, fix and rerun, with at most **5** full
 gate attempts. If it is still red after 5, set `status: blocked` with a `notes:` line saying why, commit what is useful,
 and open the PR as a **draft** (step 9) titled `[blocked] <task-id>: ...`.
 
@@ -90,11 +91,24 @@ git push -u origin agent/<task-id>
 gh pr create --base main --head agent/<task-id> --title "<task-id>: <title>" --body-file <filled .github/pull_request_template.md>
 ```
 
-Fill every PR template section. Never merge.
+Fill every PR template section. Then run `make check-agent-pr` and `gh pr checks <n> --watch`. If a required check
+(`ci-pass`, `dco`, `agent-pr`) fails, read it with `gh run view <id> --log-failed`, fix, commit and push; this counts toward
+the 5 gate attempts. Never merge.
 
 ## 10. Report
 
 Print: task id, PR URL, gate result, follow-ups. Nothing else.
+
+## Parallel (orchestrator)
+
+1. Steps 1–3 once, on main.
+2. Select every eligible task (AGENTS.md "Work selection" rule 3). Write the list and the overlap reasoning in your report.
+3. Launch one `general-purpose` subagent per task with `isolation: "worktree"`, all in a single message. Each prompt contains
+   the task's backlog entry verbatim, the DESIGN.md sections it touches, AGENTS.md invariants and hard rules, and
+   instructions to run steps 5–9 of this skill for that task only, on `agent/<task-id>`.
+4. GPU tests share one device: tell each subagent to run `make test-gpu` and GPU acceptance commands with
+   `flock /tmp/kvasir-gpu.lock <command>` so they serialize.
+5. When all subagents report, list each PR with its checks (`gh pr checks <n>`) and reviewer verdict. Never merge.
 
 ## Triage (no feature work)
 
