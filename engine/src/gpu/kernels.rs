@@ -25,6 +25,14 @@ pub struct Kernels {
     kv_append: CudaFunction,
     attention_decode: Vec<CudaFunction>,
     attention_prefill: Vec<CudaFunction>,
+    pub(super) gemv: GemvKernels,
+}
+
+pub(super) struct GemvKernels {
+    pub(super) f16: CudaFunction,
+    pub(super) f32: CudaFunction,
+    pub(super) add: CudaFunction,
+    pub(super) silu_mul: CudaFunction,
 }
 
 const ATT_HEAD_DIMS: [usize; 2] = [64, 128];
@@ -60,11 +68,11 @@ pub fn check_attention_dims(n_q: usize, n_kv: usize, head_dim: usize) -> Result<
     Ok(group)
 }
 
-fn check_aligned<T>(v: &impl DevicePtr<T>, stream: &CudaStream, align: u64, what: &str) -> Result<()> {
+pub(super) fn check_aligned<T>(v: &impl DevicePtr<T>, stream: &CudaStream, align: u64, what: &str) -> Result<()> {
     let (ptr, _sync) = v.device_ptr(stream);
     ensure_shape!(
         ptr.is_multiple_of(align),
-        "attention: {what} at {ptr:#x} is not {align}-byte aligned"
+        "{what} at {ptr:#x} is not {align}-byte aligned"
     );
     Ok(())
 }
@@ -83,6 +91,7 @@ impl Kernels {
         let silu = load_ptx(ctx, ptx!("silu_mul"))?;
         let elem = load_ptx(ctx, ptx!("elementwise"))?;
         let attn = load_ptx(ctx, ptx!("attention"))?;
+        let gemv = load_ptx(ctx, ptx!("gemv"))?;
         let variants = |kind: &str| -> Result<Vec<CudaFunction>> {
             let mut v = Vec::new();
             for hd in ATT_HEAD_DIMS {
@@ -95,6 +104,12 @@ impl Kernels {
         Ok(Self {
             attention_decode: variants("decode")?,
             attention_prefill: variants("prefill")?,
+            gemv: GemvKernels {
+                f16: gemv.load_function("gemv_f16")?,
+                f32: gemv.load_function("gemv_f32")?,
+                add: gemv.load_function("gemv_add")?,
+                silu_mul: gemv.load_function("gemv_silu_mul")?,
+            },
             embedding_gather: embedding.load_function("embedding_gather")?,
             rmsnorm: rmsnorm.load_function("rmsnorm")?,
             rope_inplace: rope.load_function("rope_inplace")?,
@@ -106,7 +121,7 @@ impl Kernels {
     }
 }
 
-fn i32_of(x: usize, what: &str) -> Result<i32> {
+pub(super) fn i32_of(x: usize, what: &str) -> Result<i32> {
     i32::try_from(x).map_err(|_| KvasirError::Shape(format!("{what}={x} does not fit in i32")))
 }
 
@@ -397,11 +412,11 @@ impl Gpu {
             scratch.len(),
             attention_scratch_len(n_q, head_dim)
         );
-        check_aligned(qkv, &self.stream, 16, "qkv")?;
-        check_aligned(kc, &self.stream, 16, "kc")?;
-        check_aligned(vc, &self.stream, 16, "vc")?;
-        check_aligned(out, &self.stream, 4, "out")?;
-        check_aligned(scratch, &self.stream, 4, "scratch")?;
+        check_aligned(qkv, &self.stream, 16, "attention: qkv")?;
+        check_aligned(kc, &self.stream, 16, "attention: kc")?;
+        check_aligned(vc, &self.stream, 16, "attention: vc")?;
+        check_aligned(out, &self.stream, 4, "attention: out")?;
+        check_aligned(scratch, &self.stream, 4, "attention: scratch")?;
         let (p, nq, ms, rs) = (
             i32_of(pos0, "pos0")?,
             i32_of(n_q, "n_q")?,
