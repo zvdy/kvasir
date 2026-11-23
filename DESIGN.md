@@ -18,12 +18,13 @@ engine/
     config.rs         LlamaConfig from config.json (validated; rope_type must be "llama3" or absent)
     rope.rs           host cos/sin tables incl. llama3 long-context frequency scaling
     weights.rs        mmap safetensors -> GPU, BF16->FP16 on device, QKV and gate/up fused
-    llama.rs          forward pass (prefill / decode)                    [not written yet]
+    llama.rs          Llama { cfg, Weights, KvCache, Workspace }: forward(ids, Logits::Last | All)
     workspace.rs      Workspace: preallocated activations; WorkspaceDims = pure size math
   src/kv/             KvCache: contiguous K/V, per-layer views, length + bounds tracking
   src/sampling.rs     greedy / temperature / top-p on host               [not written yet]
   src/bin/kvasir.rs   `kvasir generate --model <dir> --prompt ...`       [not written yet]
-engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint), workspace.rs, kv.rs (cache placement)
+engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint), workspace.rs, kv.rs (cache placement),
+                      forward.rs (tiny model vs CPU f64 reference forward)
 tests/ , ref/         logit-matching test and HF reference dumper        [not written yet]
 ```
 
@@ -48,7 +49,7 @@ Conventions: everything is row-major, contiguous, FP16 unless stated. `T` = numb
 | attention out | `[T, 2048]` | head `h` at columns `[64h, 64h+64)` |
 | gate/up activation | `[T, 16384]` | `silu_mul` reads it, writes `[T, 8192]` |
 | logits | `[T_head, 128256]` FP32 | never rounded to FP16 |
-| RoPE cos/sin | `[max_seq, 32]` FP32 | built on host, uploaded once |
+| RoPE cos/sin | `[max_seq, 32]` FP32 | built on host, uploaded once by `KvCache::from_config`, which owns them |
 
 **Workspace.** Allocated once for `max_tokens` (T upper bound) and `max_head_rows` (T_head upper bound, 1 for
 generation): `ids [T] i32`, `hidden`/`normed`/`proj [T, hidden]` (`proj` = o_proj / down_proj output before the
@@ -79,9 +80,26 @@ Per layer/head the keys are contiguous over positions, so the attention kernel s
 call `pos0 = cache.len()`; each layer calls `append` then `attention` (both use `pos0`), and `advance(T)` commits
 once after the last layer. Every call checks `len + T ≤ max_seq` and returns `KvasirError::Shape` on overflow.
 
+**RoPE table ownership.** The cos/sin tables live in `KvCache` (built by `from_config`, `[max_seq, head_dim/2]` each),
+not in `Workspace`: their row count is the cache capacity `max_seq`, not `max_tokens`, and every position a
+forward call can rotate is exactly a position the cache can hold, so one bound covers both. `KvCache::new` (generic
+dimensions, no config) builds none and `rope()` then returns an error. 2 × 4096 × 32 × 4 B = 1 MiB for Llama 3.2 1B.
+
 **Prefill vs decode.** Same layer code and same kernels; `T = prompt_len, pos0 = 0` vs `T = 1, pos0 = cur_len`.
 Query `i` attends to keys `[0, pos0+i]`. Only the *last* row goes through the final norm and LM head during
 generation (the logit-matching test asks for all rows).
+
+**Forward pass (`model::Llama`).** `Llama` owns `Weights`, `KvCache` and `Workspace` and holds no other device
+memory. `forward(gpu, ids, Logits::Last | Logits::All)` runs `ids` at positions `len..len+T` and returns a host
+slice of FP32 logits (`[1, vocab]` or `[T, vocab]`, borrowed from the workspace's reused host buffer). Per layer:
+`rmsnorm → W_qkv → rope_inplace → cache.append → cache.attention → W_o → hidden += proj → rmsnorm → W_gu →
+silu_mul → W_down → hidden += proj`; then `cache.advance(T)`, the final norm on the last `T_head` rows only (written
+to the leading rows of `normed`) and the LM head GEMM into `logits`. All views are leading-row slices
+(`DeviceTensor::row_view`); nothing is allocated per call. Inputs (`1 ≤ T ≤ max_tokens`, `T_head ≤ max_head_rows`,
+`len + T ≤ max_seq`, ids `< vocab`) are validated before any device work, so a rejected call leaves the sequence
+unchanged; `len` only advances after the last layer. `Llama::new` rejects `max_tokens > max_seq` and a `max_seq`
+above the attention kernel's shared-memory limit (`(max_seq + head_dim + 128)·4 B ≤ 48 KiB`, 12 096 for
+head_dim 64), so the limit surfaces at construction instead of mid-generation. `reset`/`truncate` rewind the cache.
 
 ## 3. Kernels (naive, correct, validated against CPU before use)
 
@@ -131,7 +149,31 @@ are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong in
 - Rust toolchain pinned in `rust-toolchain.toml`. Clippy runs with `-D warnings` in `make ci`.
 - GPU tests (`engine/tests/kernels.rs`, `weights.rs`) need `--features gpu-tests`; plain `cargo test` runs CPU tests only.
 
-## 6. Verification plan (forward pass + reference, not yet built)
+## 6. Verification plan
+
+**Forward-pass test thresholds (`tests/forward.rs`, synthetic model).** The tiny config of `tests/weights.rs`
+(hidden 64, 2 layers, 4 q / 2 kv heads of 16, inter 128, vocab 100) with random BF16 weights (linear `U(±√(3/in))`,
+norms `U(0.5, 1.5)`, embedding `U(±1)`; logit rms ≈ 5) is run on the GPU and compared with an f64 CPU forward
+written in the test, in two flavours: exact, and one that rounds to FP16 at every point where the GPU stores an FP16
+activation. Metric: max |logit error| over all rows.
+
+- The error is quantised by single FP16 rounding flips. One ulp of a hidden value `x_k` (2⁻¹⁰·|x_k|) moves a logit by
+  ≈ 2⁻¹⁰ · (|x_k|/rms(x)) · w_k · |E_vk| ≲ 2⁻¹⁰ · 3 · 1.5 · 1 ≈ 4e-3; a few such flips across 2 layers give ~1–2e-2.
+  Any change of accumulation order (cuBLAS picks different algorithms for T = 1 and T = 24, f32 vs f64 sums) flips
+  some roundings, so the FP16-emulating reference, GPU decode-vs-prefill and the exact reference all sit at the
+  *same* floor; emulation does not buy a tighter bound.
+- Measured over 30 random models × 24 tokens: worst vs FP16-emulated 2.14e-2, vs exact 2.40e-2, decode-vs-prefill
+  1.99e-2. **`TOL = 5e-2`** (≈ 2× the worst of 30, ≈ 1% of logit rms) for every comparison that crosses an FP16
+  rounding: GPU vs either reference, decode vs prefill, chunked prefill + decode vs reference, truncate + recompute.
+- Power check, asserted in the test: references with a plausible bug differ from the GPU by ≥ 10×TOL; the smallest
+  over the 30 models were 13.6 (GQA `h % n_kv` instead of `h / group`), 10.4 (interleaved instead of rotate_half RoPE)
+  and 10.3 (query `i` also sees key `i+1`). A uniform position shift is *not* detectable (RoPE is relative), by design.
+- `Logits::Last` vs the last row of `Logits::All` for the same tokens differ only in the FP32-output head GEMM
+  (layers run with the same T, final norm is per row): bound 2·γ₆₃·Σ|aᵢbᵢ| ≈ 3e-4, measured 3.3e-6,
+  **`TOL_HEAD_ONLY = 1e-3`**. A reset followed by the same call must be bit-identical.
+- Top-1 must agree with the exact reference at every position whose reference top-2 margin exceeds 2·TOL.
+
+**Real-model logit test (S1-06/S1-07, not yet built).**
 
 - `ref/dump_logits.py`: HF `LlamaForCausalLM`, FP32, eager attention → prompt ids, prefill logits (all positions),
   greedy tokens (48 steps), decode logits for the first 16 steps (teacher-forced). Also an HF-**FP16** run, giving the
@@ -152,4 +194,5 @@ are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong in
 | real Llama 3.2 1B weights | **missing**: gated repo, backlog `ENV-weights` |
 | workspace (activation buffers, ids upload, logits D2H into a reused host buffer) | done (S1-01); CPU size tests + GPU alloc/round-trip test |
 | KV cache (`KvCache`) | done (S1-02); `tests/kv.rs` (6 GPU tests: exact placement at several `pos0`, overflow errors, attention via layer view) |
-| forward pass, sampling, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-03 … S1-08) |
+| forward pass (`Llama::forward`, prefill / chunked prefill / decode) | done (S1-03); `tests/forward.rs` (6 GPU tests vs f64 CPU reference on a synthetic model, thresholds §6) |
+| sampling, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-04 … S1-08) |

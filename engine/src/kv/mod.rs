@@ -4,11 +4,12 @@ use half::f16;
 use crate::ensure_shape;
 use crate::error::{KvasirError, Result};
 use crate::gpu::{DeviceTensor, Gpu};
-use crate::model::LlamaConfig;
+use crate::model::{rope, LlamaConfig};
 
 pub struct KvCache {
     k: DeviceTensor<f16>,
     v: DeviceTensor<f16>,
+    rope: Option<(DeviceTensor<f32>, DeviceTensor<f32>)>,
     layers: usize,
     n_kv: usize,
     max_seq: usize,
@@ -26,6 +27,7 @@ impl KvCache {
         Ok(Self {
             k: DeviceTensor::zeros(gpu, &shape)?,
             v: DeviceTensor::zeros(gpu, &shape)?,
+            rope: None,
             layers,
             n_kv,
             max_seq,
@@ -40,7 +42,23 @@ impl KvCache {
             "kv cache: max_seq {max_seq} exceeds max_position_embeddings {}",
             cfg.max_position_embeddings
         );
-        Self::new(gpu, cfg.num_layers, cfg.num_kv_heads, max_seq, cfg.head_dim)
+        let mut cache = Self::new(gpu, cfg.num_layers, cfg.num_kv_heads, max_seq, cfg.head_dim)?;
+        let (cos, sin) = rope::cos_sin_table(cfg, max_seq);
+        let shape = [max_seq, cfg.head_dim / 2];
+        cache.rope = Some((
+            DeviceTensor::from_host(gpu, &cos, &shape)?,
+            DeviceTensor::from_host(gpu, &sin, &shape)?,
+        ));
+        Ok(cache)
+    }
+
+    /// RoPE cos/sin tables `[max_seq, head_dim/2]` FP32; present only when built with `from_config`.
+    pub fn rope(&self) -> Result<(CudaView<'_, f32>, CudaView<'_, f32>)> {
+        let (cos, sin) = self
+            .rope
+            .as_ref()
+            .ok_or_else(|| KvasirError::Config("kv cache built without RoPE tables (use from_config)".into()))?;
+        Ok((cos.buf.as_view(), sin.buf.as_view()))
     }
 
     pub fn layers(&self) -> usize {

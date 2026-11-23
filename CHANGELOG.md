@@ -14,6 +14,9 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
 - Apache-2.0 license, governance docs, CI (CUDA container build, cargo-deny, DCO, OpenSSF Scorecard), ADRs.
 - `kv::KvCache`: contiguous FP16 K/V cache `[layers, n_kv, max_seq, head_dim]` with per-layer views for `kv_append`
   and `attention`, length tracking and overflow errors (S1-02).
+- `model::Llama`: forward pass over `Weights` + `KvCache` + `Workspace` for prefill, chunked prefill and decode;
+  `forward(gpu, ids, Logits::Last | Logits::All)` returns FP32 logits without device allocation. `KvCache::from_config`
+  now owns the RoPE cos/sin tables; `DeviceTensor::row_view(_mut)` give leading/ranged row views (S1-03).
 
 ### Changed
 

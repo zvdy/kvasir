@@ -40,7 +40,7 @@ tasks:
 
   - id: S1-03
     title: Llama forward pass (prefill and decode)
-    status: todo
+    status: done
     depends_on: [S1-01, S1-02]
     files: [engine/src/model/llama.rs, engine/src/model/mod.rs, engine/tests/forward.rs, engine/Cargo.toml]
     acceptance:
