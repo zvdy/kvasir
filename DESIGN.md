@@ -20,10 +20,10 @@ engine/
     weights.rs        mmap safetensors -> GPU, BF16->FP16 on device, QKV and gate/up fused
     llama.rs          forward pass (prefill / decode)                    [not written yet]
     workspace.rs      Workspace: preallocated activations; WorkspaceDims = pure size math
-  src/kv/             contiguous KV cache                                [not written yet]
+  src/kv/             KvCache: contiguous K/V, per-layer views, length + bounds tracking
   src/sampling.rs     greedy / temperature / top-p on host               [not written yet]
   src/bin/kvasir.rs   `kvasir generate --model <dir> --prompt ...`       [not written yet]
-engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint), workspace.rs
+engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint), workspace.rs, kv.rs (cache placement)
 tests/ , ref/         logit-matching test and HF reference dumper        [not written yet]
 ```
 
@@ -74,6 +74,10 @@ Per layer/head the keys are contiguous over positions, so the attention kernel s
 `max_seq` is chosen at startup (default 4096 → 2 × 16·8·4096·64·2 B = 128 MiB total). `kv_append` writes the
 (already RoPE'd) K and raw V of the new tokens at `pos0..pos0+T`. This maps directly onto stage 3's paged blocks
 (`[block, kv_head, block_size, head_dim]`): only the address computation in `attention`/`kv_append` changes.
+`KvCache` (`src/kv/`) hands the kernels layer `l` as the contiguous `[n_kv, max_seq, head_dim]` slice at offset
+`l·n_kv·max_seq·head_dim`, which is exactly the per-layer layout both wrappers check. Step protocol: during a forward
+call `pos0 = cache.len()`; each layer calls `append` then `attention` (both use `pos0`), and `advance(T)` commits
+once after the last layer. Every call checks `len + T ≤ max_seq` and returns `KvasirError::Shape` on overflow.
 
 **Prefill vs decode.** Same layer code and same kernels; `T = prompt_len, pos0 = 0` vs `T = 1, pos0 = cur_len`.
 Query `i` attends to keys `[0, pos0+i]`. Only the *last* row goes through the final norm and LM head during
@@ -147,4 +151,5 @@ are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong in
 | config, RoPE table, weight loader | done; loader tested on a synthetic BF16 checkpoint (exact fused-layout check) |
 | real Llama 3.2 1B weights | **missing**: gated repo, backlog `ENV-weights` |
 | workspace (activation buffers, ids upload, logits D2H into a reused host buffer) | done (S1-01); CPU size tests + GPU alloc/round-trip test |
-| forward pass, KV cache, sampling, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-02 … S1-08) |
+| KV cache (`KvCache`) | done (S1-02); `tests/kv.rs` (6 GPU tests: exact placement at several `pos0`, overflow errors, attention via layer view) |
+| forward pass, sampling, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-03 … S1-08) |
