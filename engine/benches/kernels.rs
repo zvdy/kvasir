@@ -193,6 +193,59 @@ fn gemm_case(b: &mut Bench, name: &str, t: usize, in_dim: usize, out_dim: usize,
     })
 }
 
+#[derive(Clone, Copy)]
+enum Gemv {
+    F16,
+    F32,
+    Add,
+    SiluMul,
+}
+
+// T = 1 decode GEMV; `out_dim` is the output length (for SiluMul the weight has 2·out_dim rows). `norm` fuses the
+// RMSNorm of x into the prologue, as the forward pass does for qkv, gate/up and the LM head.
+fn gemv_case(b: &mut Bench, name: &str, kind: Gemv, in_dim: usize, out_dim: usize, norm: bool) -> Res<()> {
+    let w_rows = if matches!(kind, Gemv::SiluMul) {
+        2 * out_dim
+    } else {
+        out_dim
+    };
+    let wbytes = w_rows * in_dim * 2;
+    let ws = b.copies(w_rows * in_dim, wbytes)?;
+    let x = b.alloc(in_dim)?;
+    let nw = b.alloc(in_dim)?;
+    let mut y16 = b.alloc(out_dim)?;
+    let mut y32 = b.gpu.stream.alloc_zeros::<f32>(out_dim)?;
+    let ybytes = match kind {
+        Gemv::F16 | Gemv::SiluMul => 2 * out_dim,
+        Gemv::F32 => 4 * out_dim,
+        Gemv::Add => 4 * out_dim,
+    };
+    let xbytes = if norm { 4 * in_dim } else { 2 * in_dim };
+    b.run(name, wbytes + xbytes + ybytes, 2 * w_rows * in_dim, |g, i| {
+        let w = ws[i % ws.len()].as_view();
+        let (x, y, nwv) = (x.as_view(), &mut y16.as_view_mut(), nw.as_view());
+        let nm = norm.then_some(gemm::Norm { w: &nwv, eps: EPS });
+        match kind {
+            Gemv::F16 => gemm::gemv_f16(g, &x, &w, y, in_dim, out_dim, nm)?,
+            Gemv::F32 => gemm::gemv_f32(g, &x, &w, &mut y32.as_view_mut(), in_dim, out_dim, nm)?,
+            Gemv::Add => gemm::gemv_add(g, &x, &w, y, in_dim, out_dim)?,
+            Gemv::SiluMul => gemm::gemv_silu_mul(g, &x, &w, y, in_dim, out_dim, nm)?,
+        }
+        Ok(())
+    })
+}
+
+fn gemv_all(b: &mut Bench) -> Res<()> {
+    gemv_case(b, "gemv_qkv/t1", Gemv::F16, HIDDEN, QKV, false)?;
+    gemv_case(b, "gemv_qkv_norm/t1", Gemv::F16, HIDDEN, QKV, true)?;
+    gemv_case(b, "gemv_o_add/t1", Gemv::Add, HIDDEN, HIDDEN, false)?;
+    gemv_case(b, "gemv_gate_up_silu/t1", Gemv::SiluMul, HIDDEN, INTER, false)?;
+    gemv_case(b, "gemv_gate_up_silu_norm/t1", Gemv::SiluMul, HIDDEN, INTER, true)?;
+    gemv_case(b, "gemv_down_add/t1", Gemv::Add, INTER, HIDDEN, false)?;
+    gemv_case(b, "gemv_lm_head/t1", Gemv::F32, HIDDEN, VOCAB, false)?;
+    gemv_case(b, "gemv_lm_head_norm/t1", Gemv::F32, HIDDEN, VOCAB, true)
+}
+
 fn attention_case(b: &mut Bench, name: &str, t: usize, pos0: usize) -> Res<()> {
     // max_seq = len so the rotated copies hold only what is read and their count really covers ROTATE_BYTES.
     let len = pos0 + t;
@@ -324,7 +377,7 @@ fn bench_all(b: &mut Bench) -> Res<()> {
         gemm_case(b, &format!("gemm_down/t{t}"), t, INTER, HIDDEN, false)?;
         gemm_case(b, &format!("lm_head/t{t}"), t, HIDDEN, VOCAB, true)?;
     }
-    Ok(())
+    gemv_all(b)
 }
 
 fn print_table(cur: &Report, base: Option<&Report>) -> usize {
