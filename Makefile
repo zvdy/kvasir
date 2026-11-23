@@ -1,4 +1,4 @@
-.PHONY: build fmt fmt-check lint test-cpu test-gpu kernels bench bench-baseline deny doc ci ci-local doctor clean
+.PHONY: build fmt fmt-check lint test-cpu test-gpu kernels bench bench-kernels bench-forward bench-baseline deny doc ci ci-local doctor clean
 
 CARGO ?= cargo
 
@@ -24,13 +24,19 @@ test-gpu:
 kernels:
 	$(CARGO) test --release --features gpu-tests --test kernels -- --nocapture --test-threads=1
 
-BENCH = $(CARGO) bench -p kvasir --features gpu-tests --bench kernels --
+BENCH = $(CARGO) bench -p kvasir --features gpu-tests --bench
 
-bench:
-	$(BENCH) --out $(CURDIR)/target/bench/kernels.json --compare $(CURDIR)/bench/kernels-baseline.json
+bench: bench-kernels bench-forward
+
+bench-kernels:
+	$(BENCH) kernels -- --out $(CURDIR)/target/bench/kernels.json --compare $(CURDIR)/bench/kernels-baseline.json
+
+bench-forward:
+	$(BENCH) forward -- --out $(CURDIR)/target/bench/forward.json --compare $(CURDIR)/bench/forward-baseline.json
 
 bench-baseline:
-	$(BENCH) --out $(CURDIR)/bench/kernels-baseline.json
+	$(BENCH) kernels -- --out $(CURDIR)/bench/kernels-baseline.json
+	$(BENCH) forward -- --out $(CURDIR)/bench/forward-baseline.json
 
 deny:
 	$(CARGO) deny --all-features check

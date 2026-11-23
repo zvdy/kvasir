@@ -1,0 +1,89 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4070",
+  "roofline_gbps": 504.0,
+  "decode_bytes": 2471628800,
+  "roofline_ms": 4.904025396825396,
+  "results": [
+    {
+      "name": "prefill/t128",
+      "median_ms": 7.654256,
+      "p10_ms": 7.569782,
+      "p90_ms": 7.68318,
+      "tok_s": 16722.722626470815,
+      "pct_roofline": 0.0,
+      "gated": true
+    },
+    {
+      "name": "decode/ctx128/wall",
+      "median_ms": 5.673651,
+      "p10_ms": 5.668051,
+      "p90_ms": 5.692857,
+      "tok_s": 176.25335079651532,
+      "pct_roofline": 86.43509085816868,
+      "gated": true
+    },
+    {
+      "name": "decode/ctx128/device",
+      "median_ms": 5.75324821472168,
+      "p10_ms": 5.748703956604004,
+      "p90_ms": 5.7618560791015625,
+      "tok_s": 173.81485426635223,
+      "pct_roofline": 85.23924596676964,
+      "gated": true
+    },
+    {
+      "name": "decode/ctx512/wall",
+      "median_ms": 5.747978,
+      "p10_ms": 5.742687,
+      "p90_ms": 5.753628,
+      "tok_s": 173.97422189159388,
+      "pct_roofline": 85.31740025493133,
+      "gated": true
+    },
+    {
+      "name": "decode/ctx512/device",
+      "median_ms": 5.7999677658081055,
+      "p10_ms": 5.795711994171143,
+      "p90_ms": 5.808512210845947,
+      "tok_s": 172.41475131899648,
+      "pct_roofline": 84.55263192556937,
+      "gated": true
+    },
+    {
+      "name": "decode/ctx2048/wall",
+      "median_ms": 5.832634,
+      "p10_ms": 5.822705,
+      "p90_ms": 5.8618369999999995,
+      "tok_s": 171.4491257294732,
+      "pct_roofline": 84.0790866840847,
+      "gated": true
+    },
+    {
+      "name": "decode/ctx2048/device",
+      "median_ms": 5.910880088806152,
+      "p10_ms": 5.90451192855835,
+      "p90_ms": 5.922624111175537,
+      "tok_s": 169.17954432771694,
+      "pct_roofline": 82.96607820064719,
+      "gated": true
+    },
+    {
+      "name": "logits_d2h",
+      "median_ms": 0.040464,
+      "p10_ms": 0.039713,
+      "p90_ms": 0.041124999999999995,
+      "tok_s": 0.0,
+      "pct_roofline": 0.0,
+      "gated": false
+    },
+    {
+      "name": "host_argmax",
+      "median_ms": 0.056434000000000005,
+      "p10_ms": 0.056373,
+      "p90_ms": 0.058107,
+      "tok_s": 0.0,
+      "pct_roofline": 0.0,
+      "gated": false
+    }
+  ]
+}
