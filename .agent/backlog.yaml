@@ -28,7 +28,7 @@ tasks:
 
   - id: S1-02
     title: Contiguous KvCache
-    status: todo
+    status: done
     depends_on: []
     files: [engine/src/kv/mod.rs, engine/tests/kv.rs, engine/Cargo.toml]
     acceptance:
