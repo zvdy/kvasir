@@ -28,7 +28,7 @@ tasks:
 
   - id: S1-02
     title: Contiguous KvCache
-    status: todo
+    status: done
     depends_on: []
     files: [engine/src/kv/mod.rs, engine/src/lib.rs, engine/tests/kv.rs, engine/Cargo.toml]
     acceptance:
@@ -40,7 +40,7 @@ tasks:
 
   - id: S1-03
     title: Llama forward pass (prefill and decode)
-    status: todo
+    status: done
     depends_on: [S1-01, S1-02]
     files: [engine/src/model/llama.rs, engine/src/model/mod.rs, engine/tests/forward.rs, engine/Cargo.toml]
     acceptance:
@@ -52,7 +52,7 @@ tasks:
 
   - id: S1-04
     title: Host sampling (greedy, temperature, top-p)
-    status: todo
+    status: done
     depends_on: []
     files: [engine/src/sampling.rs]
     acceptance:
@@ -61,7 +61,7 @@ tasks:
 
   - id: S1-05
     title: CLI `kvasir generate`
-    status: todo
+    status: done
     depends_on: [S1-03, S1-04]
     files: [engine/src/bin/kvasir.rs]
     acceptance:
@@ -119,11 +119,57 @@ tasks:
 
   - id: H-01
     title: Kernel microbenchmarks with stored baseline
-    status: todo
+    status: done
     depends_on: []
     files: [engine/benches/, engine/Cargo.toml, Makefile, bench/]
     acceptance:
       - make bench
     notes: >
-      Criterion benches for each kernel at Llama dims behind the gpu-tests feature. `make bench` compares
+      Benches for each kernel at Llama dims behind the gpu-tests feature (self-contained harness, no criterion). `make bench` compares
       against bench/kernels-baseline.json and fails on > 10% regression.
+
+  - id: A-01
+    title: Flash-decoding attention kernel
+    status: done
+    depends_on: [H-01]
+    files: [engine/kernels/attention.cu, engine/kernels/common.cuh, engine/src/gpu/kernels.rs, engine/tests/kernels.rs,
+            bench/kernels-baseline.json, DESIGN.md]
+    acceptance:
+      - cargo test --release --features gpu-tests --test kernels
+      - make bench
+    notes: >
+      Decode split-K over context with GQA-shared K/V loads and online softmax; tiled causal prefill. Remove the
+      ~11.9k kv-length cap. Target decode ctx 2048 >= 60% of bandwidth, prefill >= 10x. Wrapper gains a `scratch`
+      parameter (`attention_scratch_len`); callers outside this branch (KvCache::attention) adapt on merge.
+
+  - id: I-01
+    title: Wire flash-decoding attention into the forward pass; full-size decode bench
+    status: done
+    depends_on: [S1-03, A-01]
+    files: [engine/src/kv/mod.rs, engine/src/model/llama.rs, engine/src/model/workspace.rs, engine/src/gpu/kernels.rs,
+            engine/tests/forward.rs, engine/tests/kv.rs, engine/tests/workspace.rs, engine/tests/cli.rs,
+            engine/benches/forward.rs, bench/forward-baseline.json, Makefile, DESIGN.md]
+    acceptance:
+      - cargo test --release --features gpu-tests --test forward --test kv --test kernels
+      - make bench
+    notes: >
+      Workspace owns the attention scratch; Llama::new checks attention variants instead of the smem cap; alignment
+      errors instead of misaligned launches. benches/forward.rs: prefill 128 and decode ms/token at ctx 128/512/2048
+      vs the decode_bytes roofline, with a stored baseline. Top bottlenecks in DESIGN §8.
+
+  - id: P-01
+    title: Hand-written FP16 decode GEMV with fused epilogues instead of cuBLAS at T=1
+    status: done
+    depends_on: [I-01]
+    files: [engine/kernels/gemv.cu, engine/src/gpu/gemm.rs, engine/src/gpu/kernels.rs, engine/src/model/llama.rs,
+            engine/tests/kernels.rs, engine/benches/kernels.rs, bench/kernels-baseline.json,
+            bench/forward-baseline.json, DESIGN.md, docs/adr/0007-hand-written-decode-gemv.md,
+            docs/adr/0002-cublas-only-for-gemm.md]
+    acceptance:
+      - cargo test --release --features gpu-tests --test kernels --test forward --test cli
+      - make bench
+    notes: >
+      gemv_f16/f32/add/silu_mul with optional fused RMSNorm prologue; T=1 layers are 7 launches. Kernel at the DRAM
+      streaming rate (2.1 us + bytes/470.6 GB/s); qkv 86%, o 83%, gate_up 92%, down 89%, head 94% of 504 GB/s.
+      Decode ctx 2048 5.83 -> 5.67 ms/token. ADR 0007 amends 0002. Next: PDL / rope+kv_append epilogue (DESIGN §8).
+

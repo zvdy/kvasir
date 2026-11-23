@@ -1,8 +1,10 @@
-use cudarc::driver::{CudaSlice, DeviceRepr, ValidAsZeroBits};
+use std::ops::Range;
+
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, DeviceRepr, ValidAsZeroBits};
 
 use super::device::Gpu;
 use crate::ensure_shape;
-use crate::error::Result;
+use crate::error::{KvasirError, Result};
 
 pub struct DeviceTensor<T> {
     pub buf: CudaSlice<T>,
@@ -48,6 +50,18 @@ impl<T> DeviceTensor<T> {
     }
     pub fn cols(&self) -> usize {
         self.shape[1..].iter().product()
+    }
+    pub fn row_view(&self, rows: Range<usize>) -> Result<CudaView<'_, T>> {
+        let (c, len) = (self.cols(), self.numel());
+        self.buf
+            .try_slice(rows.start * c..rows.end * c)
+            .ok_or_else(|| KvasirError::Shape(format!("rows {rows:?} x {c} exceed buffer of {len}")))
+    }
+    pub fn row_view_mut(&mut self, rows: Range<usize>) -> Result<CudaViewMut<'_, T>> {
+        let (c, len) = (self.cols(), self.numel());
+        self.buf
+            .try_slice_mut(rows.start * c..rows.end * c)
+            .ok_or_else(|| KvasirError::Shape(format!("rows {rows:?} x {c} exceed buffer of {len}")))
     }
     pub fn from_slice(buf: CudaSlice<T>, shape: &[usize]) -> Result<Self> {
         let n: usize = shape.iter().product();

@@ -22,6 +22,8 @@ fn workspace_allocates_every_buffer_at_full_size() {
     assert_eq!(ws.gate_up.shape(), &dims.gate_up_shape());
     assert_eq!(ws.act.shape(), &dims.act_shape());
     assert_eq!(ws.logits.shape(), &dims.logits_shape());
+    assert_eq!(ws.attn_scratch.shape(), &dims.attn_scratch_shape());
+    assert!(ws.attn_scratch.to_host(&gpu).unwrap().iter().all(|&x| x == 0.0));
 
     let f16s = [
         &ws.hidden,
@@ -32,7 +34,9 @@ fn workspace_allocates_every_buffer_at_full_size() {
         &ws.gate_up,
         &ws.act,
     ];
-    let allocated = f16s.iter().map(|t| t.numel() * 2).sum::<usize>() + ws.logits.numel() * 4 + ws.ids.numel() * 4;
+    let allocated = f16s.iter().map(|t| t.numel() * 2).sum::<usize>()
+        + (ws.logits.numel() + ws.attn_scratch.numel()) * 4
+        + ws.ids.numel() * 4;
     assert_eq!(allocated, dims.device_bytes());
 }
 

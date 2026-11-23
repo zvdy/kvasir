@@ -38,3 +38,25 @@ required-features = ["gpu-tests"]
 [[test]]
 name = "workspace"
 required-features = ["gpu-tests"]
+
+[[test]]
+name = "kv"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "forward"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "cli"
+required-features = ["gpu-tests"]
+
+[[bench]]
+name = "kernels"
+harness = false
+required-features = ["gpu-tests"]
+
+[[bench]]
+name = "forward"
+harness = false
+required-features = ["gpu-tests"]

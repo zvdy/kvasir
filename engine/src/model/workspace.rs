@@ -3,6 +3,7 @@ use half::f16;
 use super::config::LlamaConfig;
 use crate::ensure_shape;
 use crate::error::{KvasirError, Result};
+use crate::gpu::kernels::attention_scratch_len;
 use crate::gpu::{DeviceTensor, Gpu};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +15,8 @@ pub struct WorkspaceDims {
     pub qkv_dim: usize,
     pub inter: usize,
     pub vocab: usize,
+    pub n_q: usize,
+    pub head_dim: usize,
 }
 
 impl WorkspaceDims {
@@ -31,6 +34,8 @@ impl WorkspaceDims {
             qkv_dim: cfg.qkv_dim(),
             inter: cfg.intermediate_size,
             vocab: cfg.vocab_size,
+            n_q: cfg.num_heads,
+            head_dim: cfg.head_dim,
         };
         let biggest = [
             d.max_tokens.checked_mul(d.hidden),
@@ -38,6 +43,7 @@ impl WorkspaceDims {
             d.max_tokens.checked_mul(d.q_dim),
             d.inter.checked_mul(2).and_then(|n| n.checked_mul(d.max_tokens)),
             d.max_head_rows.checked_mul(d.vocab),
+            Some(attention_scratch_len(d.n_q, d.head_dim)),
         ];
         for n in biggest {
             let n = n.ok_or_else(|| KvasirError::Shape("workspace: buffer size overflows usize".into()))?;
@@ -70,6 +76,9 @@ impl WorkspaceDims {
     pub fn logits_shape(&self) -> [usize; 2] {
         [self.max_head_rows, self.vocab]
     }
+    pub fn attn_scratch_shape(&self) -> [usize; 1] {
+        [attention_scratch_len(self.n_q, self.head_dim)]
+    }
 
     // hidden, normed and proj share hidden_shape.
     pub fn f16_elems(&self) -> usize {
@@ -83,7 +92,7 @@ impl WorkspaceDims {
 
     pub fn device_bytes(&self) -> usize {
         self.f16_elems() * size_of::<f16>()
-            + self.logits_shape().iter().product::<usize>() * size_of::<f32>()
+            + (self.logits_shape().iter().product::<usize>() + self.attn_scratch_shape()[0]) * size_of::<f32>()
             + self.max_tokens * size_of::<i32>()
     }
 }
@@ -99,6 +108,7 @@ pub struct Workspace {
     pub gate_up: DeviceTensor<f16>,
     pub act: DeviceTensor<f16>,
     pub logits: DeviceTensor<f32>,
+    pub attn_scratch: DeviceTensor<f32>,
     ids_host: Vec<i32>,
     logits_host: Vec<f32>,
 }
@@ -116,6 +126,7 @@ impl Workspace {
             gate_up: DeviceTensor::zeros(gpu, &dims.gate_up_shape())?,
             act: DeviceTensor::zeros(gpu, &dims.act_shape())?,
             logits: DeviceTensor::zeros(gpu, &dims.logits_shape())?,
+            attn_scratch: DeviceTensor::zeros(gpu, &dims.attn_scratch_shape())?,
             ids_host: vec![0; dims.max_tokens],
             logits_host: vec![0.0; dims.max_head_rows * dims.vocab],
         })
@@ -193,6 +204,7 @@ mod tests {
         assert_eq!(d.gate_up_shape(), [7, 16384]);
         assert_eq!(d.act_shape(), [7, 8192]);
         assert_eq!(d.logits_shape(), [1, 128256]);
+        assert_eq!(d.attn_scratch_shape(), [32 + 128 * 32 * 66]);
     }
 
     #[test]
@@ -200,7 +212,11 @@ mod tests {
         let d = WorkspaceDims::new(&cfg(), 512, 1).unwrap();
         let f16_per_tok = 3 * 2048 + 3072 + 2048 + 16384 + 8192;
         assert_eq!(d.f16_elems(), 512 * f16_per_tok);
-        assert_eq!(d.device_bytes(), 512 * f16_per_tok * 2 + 128256 * 4 + 512 * 4);
+        let scratch = 32 + 128 * 32 * 66;
+        assert_eq!(
+            d.device_bytes(),
+            512 * f16_per_tok * 2 + (128256 + scratch) * 4 + 512 * 4
+        );
     }
 
     #[test]
