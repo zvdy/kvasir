@@ -1,6 +1,6 @@
 use half::{bf16, f16};
 use kvasir::gpu::{gemm, Gpu};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 
 fn gpu() -> Gpu {
     Gpu::new(0).expect("CUDA init")

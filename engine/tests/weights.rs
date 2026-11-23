@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use half::{bf16, f16};
 use kvasir::gpu::Gpu;
 use kvasir::model::{LlamaConfig, Weights};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use safetensors::tensor::TensorView;
 use safetensors::Dtype;
 
