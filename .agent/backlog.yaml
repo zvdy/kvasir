@@ -72,7 +72,7 @@ tasks:
 
   - id: S1-06
     title: HF reference dumper
-    status: todo
+    status: done
     depends_on: []
     files: [ref/dump_logits.py, ref/requirements.txt, Makefile]
     acceptance:

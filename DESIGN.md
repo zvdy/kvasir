@@ -262,6 +262,13 @@ activation. Metric: max |logit error| over all rows.
 - `ref/dump_logits.py`: HF `LlamaForCausalLM`, FP32, eager attention → prompt ids, prefill logits (all positions),
   greedy tokens (48 steps), decode logits for the first 16 steps (teacher-forced). Also an HF-**FP16** run, giving the
   intrinsic FP16-vs-FP32 error floor.
+- `make ref` writes `ref/out/` (CPU torch, deps locked in `ref/requirements.txt`; skips with a message when the weights
+  are absent). Raw little-endian files, no header, row-major: `prompt_ids.u32` `[T]`, `greedy_ids.u32` `[48]`,
+  `prefill_logits.f32` `[T, V]`, `decode_logits.f32` `[16, V]`, and the same two logit files with suffix `_hf16`
+  (FP16 run, upcast to f32). `greedy_ids[0]` is the argmax of the last prefill row; `decode_logits[k]` is the output at
+  position `T + k` after feeding `greedy_ids[k]`. The FP16 run is teacher-forced on the FP32 greedy tokens.
+  `meta.json` (`format_version: 1`) holds shapes/dtypes per file, prompt, token ids, checkpoint sha256 and revision,
+  seed, torch/transformers versions, and the HF-FP16 floor (`hf16_floor.{prefill,decode}`: max/mean abs err, top-1).
 - `tests/logits.rs` thresholds are *calibrated from that floor* rather than guessed: max abs err ≤ 2× the HF-FP16 floor
   and ≤ 1.0 absolute, mean abs err ≤ 0.05; top-1 agreement 100% on decode steps and ≥ 99% over prefill positions
   (excluding positions whose reference top-2 margin < 0.05, reported and capped at 1%); ≥ 32 greedy tokens identical.
@@ -285,7 +292,8 @@ activation. Metric: max |logit error| over all rows.
 | attention wired into the forward pass, full-size forward bench (I-01) | done; decode 5.84 ms/token at ctx 2048 (84% of roofline), prefill 128 tok in 7.6 ms; §8 |
 | hand-written decode GEMV with fused RMSNorm / SwiGLU / residual add (P-01, ADR 0007) | done; 6 CPU-reference tests (real + odd shapes, shape errors); decode 5.69 ms/token at ctx 2048 (86% of roofline, was 84%) |
 | CLI `kvasir generate` (streamed output, EOS list, prefill/decode tok/s, `--json`) | done (S1-05); `tests/cli.rs` (6 GPU tests running the binary on a synthetic model + in-test WordLevel tokenizer) |
-| ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-06 … S1-08) |
+| HF reference dumper (`ref/dump_logits.py`, `make ref`) | done (S1-06); validated on a tiny random Llama, awaits real weights |
+| logit test, perf report | ordered in `.agent/backlog.yaml` (S1-07, S1-08) |
 
 ## 8. Benchmarks
 
