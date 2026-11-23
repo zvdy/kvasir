@@ -3,7 +3,7 @@ use super::weights::Weights;
 use super::workspace::{Workspace, WorkspaceDims};
 use crate::ensure_shape;
 use crate::error::Result;
-use crate::gpu::gemm::{linear_f16, linear_f32};
+use crate::gpu::gemm::{gemv_add, gemv_f16, gemv_f32, gemv_silu_mul, linear_f16, linear_f32, Norm};
 use crate::gpu::kernels::check_attention_dims;
 use crate::gpu::Gpu;
 use crate::kv::KvCache;
@@ -37,6 +37,15 @@ impl Llama {
             cfg.num_layers
         );
         check_attention_dims(cfg.num_heads, cfg.num_kv_heads, cfg.head_dim)?;
+        ensure_shape!(
+            [cfg.hidden_size, cfg.q_dim(), cfg.intermediate_size]
+                .iter()
+                .all(|d| d.is_multiple_of(8)),
+            "llama: hidden {} / q_dim {} / intermediate {} must be multiples of 8 (decode GEMV)",
+            cfg.hidden_size,
+            cfg.q_dim(),
+            cfg.intermediate_size
+        );
         ensure_shape!(
             max_seq <= Self::max_seq_limit(cfg.head_dim),
             "llama: max_seq {max_seq} exceeds the attention kernel's kv length limit {}",
@@ -125,24 +134,42 @@ impl Llama {
             &mut ws.hidden.row_view_mut(0..t)?,
             h,
         )?;
+        // T = 1: fused GEMVs (ADR 0007, DESIGN.md §2 "Forward pass"); otherwise cuBLAS + separate kernels.
+        let gemv = t == 1;
         for (l, lw) in self.weights.layers.iter().enumerate() {
-            gpu.rmsnorm(
-                &ws.hidden.row_view(0..t)?,
-                &lw.attn_norm.buf.as_view(),
-                &mut ws.normed.row_view_mut(0..t)?,
-                t,
-                h,
-                eps,
-            )?;
-            linear_f16(
-                gpu,
-                &ws.normed.row_view(0..t)?,
-                &lw.w_qkv.buf.as_view(),
-                &mut ws.qkv.row_view_mut(0..t)?,
-                t,
-                h,
-                qkv_dim,
-            )?;
+            if gemv {
+                let norm = Norm {
+                    w: &lw.attn_norm.buf.as_view(),
+                    eps,
+                };
+                gemv_f16(
+                    gpu,
+                    &ws.hidden.row_view(0..1)?,
+                    &lw.w_qkv.buf.as_view(),
+                    &mut ws.qkv.row_view_mut(0..1)?,
+                    h,
+                    qkv_dim,
+                    Some(norm),
+                )?;
+            } else {
+                gpu.rmsnorm(
+                    &ws.hidden.row_view(0..t)?,
+                    &lw.attn_norm.buf.as_view(),
+                    &mut ws.normed.row_view_mut(0..t)?,
+                    t,
+                    h,
+                    eps,
+                )?;
+                linear_f16(
+                    gpu,
+                    &ws.normed.row_view(0..t)?,
+                    &lw.w_qkv.buf.as_view(),
+                    &mut ws.qkv.row_view_mut(0..t)?,
+                    t,
+                    h,
+                    qkv_dim,
+                )?;
+            }
             {
                 let (cos, sin) = self.cache.rope()?;
                 gpu.rope_inplace(&mut ws.qkv.row_view_mut(0..t)?, &cos, &sin, t, pos0, n_q, n_kv, hd)?;
@@ -157,66 +184,110 @@ impl Llama {
                 t,
                 n_q,
             )?;
-            linear_f16(
-                gpu,
-                &ws.attn.row_view(0..t)?,
-                &lw.w_o.buf.as_view(),
-                &mut ws.proj.row_view_mut(0..t)?,
-                t,
-                q_dim,
-                h,
-            )?;
-            gpu.add_inplace(&mut ws.hidden.row_view_mut(0..t)?, &ws.proj.row_view(0..t)?)?;
-
-            gpu.rmsnorm(
-                &ws.hidden.row_view(0..t)?,
-                &lw.mlp_norm.buf.as_view(),
-                &mut ws.normed.row_view_mut(0..t)?,
-                t,
-                h,
-                eps,
-            )?;
-            linear_f16(
-                gpu,
-                &ws.normed.row_view(0..t)?,
-                &lw.w_gu.buf.as_view(),
-                &mut ws.gate_up.row_view_mut(0..t)?,
-                t,
-                h,
-                2 * inter,
-            )?;
-            gpu.silu_mul(&ws.gate_up.row_view(0..t)?, &mut ws.act.row_view_mut(0..t)?, t, inter)?;
-            linear_f16(
-                gpu,
-                &ws.act.row_view(0..t)?,
-                &lw.w_down.buf.as_view(),
-                &mut ws.proj.row_view_mut(0..t)?,
-                t,
-                inter,
-                h,
-            )?;
-            gpu.add_inplace(&mut ws.hidden.row_view_mut(0..t)?, &ws.proj.row_view(0..t)?)?;
+            if gemv {
+                gemv_add(
+                    gpu,
+                    &ws.attn.row_view(0..1)?,
+                    &lw.w_o.buf.as_view(),
+                    &mut ws.hidden.row_view_mut(0..1)?,
+                    q_dim,
+                    h,
+                )?;
+                let norm = Norm {
+                    w: &lw.mlp_norm.buf.as_view(),
+                    eps,
+                };
+                gemv_silu_mul(
+                    gpu,
+                    &ws.hidden.row_view(0..1)?,
+                    &lw.w_gu.buf.as_view(),
+                    &mut ws.act.row_view_mut(0..1)?,
+                    h,
+                    inter,
+                    Some(norm),
+                )?;
+                gemv_add(
+                    gpu,
+                    &ws.act.row_view(0..1)?,
+                    &lw.w_down.buf.as_view(),
+                    &mut ws.hidden.row_view_mut(0..1)?,
+                    inter,
+                    h,
+                )?;
+            } else {
+                linear_f16(
+                    gpu,
+                    &ws.attn.row_view(0..t)?,
+                    &lw.w_o.buf.as_view(),
+                    &mut ws.proj.row_view_mut(0..t)?,
+                    t,
+                    q_dim,
+                    h,
+                )?;
+                gpu.add_inplace(&mut ws.hidden.row_view_mut(0..t)?, &ws.proj.row_view(0..t)?)?;
+                gpu.rmsnorm(
+                    &ws.hidden.row_view(0..t)?,
+                    &lw.mlp_norm.buf.as_view(),
+                    &mut ws.normed.row_view_mut(0..t)?,
+                    t,
+                    h,
+                    eps,
+                )?;
+                linear_f16(
+                    gpu,
+                    &ws.normed.row_view(0..t)?,
+                    &lw.w_gu.buf.as_view(),
+                    &mut ws.gate_up.row_view_mut(0..t)?,
+                    t,
+                    h,
+                    2 * inter,
+                )?;
+                gpu.silu_mul(&ws.gate_up.row_view(0..t)?, &mut ws.act.row_view_mut(0..t)?, t, inter)?;
+                linear_f16(
+                    gpu,
+                    &ws.act.row_view(0..t)?,
+                    &lw.w_down.buf.as_view(),
+                    &mut ws.proj.row_view_mut(0..t)?,
+                    t,
+                    inter,
+                    h,
+                )?;
+                gpu.add_inplace(&mut ws.hidden.row_view_mut(0..t)?, &ws.proj.row_view(0..t)?)?;
+            }
         }
         self.cache.advance(t)?;
 
-        gpu.rmsnorm(
-            &ws.hidden.row_view(t - head_rows..t)?,
-            &self.weights.final_norm.buf.as_view(),
-            &mut ws.normed.row_view_mut(0..head_rows)?,
-            head_rows,
-            h,
-            eps,
-        )?;
         let head = self.weights.head();
-        linear_f32(
-            gpu,
-            &ws.normed.row_view(0..head_rows)?,
-            &head.buf.as_view(),
-            &mut ws.logits.row_view_mut(0..head_rows)?,
-            head_rows,
-            h,
-            head.rows(),
-        )?;
+        let final_norm = self.weights.final_norm.buf.as_view();
+        if head_rows == 1 {
+            gemv_f32(
+                gpu,
+                &ws.hidden.row_view(t - 1..t)?,
+                &head.buf.as_view(),
+                &mut ws.logits.row_view_mut(0..1)?,
+                h,
+                head.rows(),
+                Some(Norm { w: &final_norm, eps }),
+            )?;
+        } else {
+            gpu.rmsnorm(
+                &ws.hidden.row_view(t - head_rows..t)?,
+                &final_norm,
+                &mut ws.normed.row_view_mut(0..head_rows)?,
+                head_rows,
+                h,
+                eps,
+            )?;
+            linear_f32(
+                gpu,
+                &ws.normed.row_view(0..head_rows)?,
+                &head.buf.as_view(),
+                &mut ws.logits.row_view_mut(0..head_rows)?,
+                head_rows,
+                h,
+                head.rows(),
+            )?;
+        }
         ws.logits_to_host(gpu, head_rows)
     }
 }
