@@ -1,6 +1,6 @@
 # 2. Hand-written kernels except GEMM (cuBLAS)
 
-Status: accepted
+Status: accepted; amended by 0007 (hand-written GEMV for decode)
 
 ## Context
 
