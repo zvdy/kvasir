@@ -38,6 +38,11 @@ impl Llama {
         );
         check_attention_dims(cfg.num_heads, cfg.num_kv_heads, cfg.head_dim)?;
         ensure_shape!(
+            max_seq <= Self::max_seq_limit(cfg.head_dim),
+            "llama: max_seq {max_seq} exceeds the attention kernel's kv length limit {}",
+            Self::max_seq_limit(cfg.head_dim)
+        );
+        ensure_shape!(
             max_tokens <= max_seq,
             "llama: max_tokens {max_tokens} exceeds max_seq {max_seq}"
         );
@@ -50,6 +55,12 @@ impl Llama {
             cache,
             ws,
         })
+    }
+
+    /// Longest cache the attention kernels can index (`max_seq` is passed as i32; offsets are 64-bit).
+    /// Independent of `head_dim` since A-01; `max_position_embeddings` still bounds it in `KvCache::from_config`.
+    pub const fn max_seq_limit(_head_dim: usize) -> usize {
+        i32::MAX as usize
     }
 
     pub fn config(&self) -> &LlamaConfig {
