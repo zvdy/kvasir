@@ -1,4 +1,6 @@
+use cudarc::driver::CudaSlice;
 use half::{bf16, f16};
+use kvasir::gpu::kernels::attention_scratch_len;
 use kvasir::gpu::{gemm, Gpu};
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 
@@ -235,6 +237,21 @@ fn kv_append_places_k_and_v() {
 
 fn attention_case(n_q: usize, n_kv: usize, hd: usize, t: usize, pos0: usize, max_seq: usize) {
     let g = gpu();
+    let mut dscratch = g.stream.alloc_zeros::<f32>(attention_scratch_len(n_q, hd)).unwrap();
+    attention_check(&g, &mut dscratch, n_q, n_kv, hd, t, pos0, max_seq);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_check(
+    g: &Gpu,
+    dscratch: &mut CudaSlice<f32>,
+    n_q: usize,
+    n_kv: usize,
+    hd: usize,
+    t: usize,
+    pos0: usize,
+    max_seq: usize,
+) {
     let mut rng = StdRng::seed_from_u64(100 + (t * 31 + pos0) as u64);
     let stride = (n_q + 2 * n_kv) * hd;
     let qkv = rand_f16(&mut rng, t * stride, 2.0);
@@ -251,6 +268,7 @@ fn attention_case(n_q: usize, n_kv: usize, hd: usize, t: usize, pos0: usize, max
         &dk.as_view(),
         &dv.as_view(),
         &mut dout.as_view_mut(),
+        &mut dscratch.as_view_mut(),
         t,
         pos0,
         n_q,
@@ -315,6 +333,61 @@ fn attention_head_dim_128() {
     attention_case(4, 2, 128, 2, 20, 64);
 }
 
+#[test]
+fn attention_decode_ctx1() {
+    attention_case(32, 8, 64, 1, 0, 16);
+}
+
+#[test]
+fn attention_decode_split_lengths() {
+    for kv_len in [63, 64, 65, 200, 1000, 2049, 8191] {
+        attention_case(32, 8, 64, 1, kv_len - 1, 8192);
+    }
+}
+
+#[test]
+fn attention_decode_reuses_scratch() {
+    let g = gpu();
+    let mut dscratch = g.stream.alloc_zeros::<f32>(attention_scratch_len(32, 64)).unwrap();
+    for kv_len in [3000, 700, 5000, 1, 4096] {
+        attention_check(&g, &mut dscratch, 32, 8, 64, 1, kv_len - 1, 8192);
+    }
+}
+
+#[test]
+fn attention_decode_beyond_old_smem_cap() {
+    attention_case(32, 8, 64, 1, 16383, 16384);
+}
+
+#[test]
+fn attention_decode_more_splits_than_cap() {
+    attention_case(32, 8, 64, 1, 40000, 40001);
+}
+
+#[test]
+fn attention_decode_head_dim_128_groups() {
+    attention_case(4, 4, 128, 1, 300, 512);
+    attention_case(16, 2, 128, 1, 777, 1024);
+}
+
+#[test]
+fn attention_prefill_llama_dims() {
+    attention_case(32, 8, 64, 128, 0, 128);
+    attention_case(32, 8, 64, 77, 0, 128);
+}
+
+#[test]
+fn attention_prefill_long_prefix() {
+    attention_case(32, 8, 64, 37, 1000, 1100);
+}
+
+#[test]
+fn attention_prefill_groups() {
+    attention_case(8, 8, 64, 70, 3, 80);
+    attention_case(16, 2, 64, 21, 50, 80);
+    attention_case(8, 2, 128, 45, 30, 80);
+}
+
 fn linear_reference(x: &[f32], w: &[f32], t: usize, i: usize, o: usize) -> Vec<f32> {
     let mut y = vec![0f32; t * o];
     for r in 0..t {
@@ -371,4 +444,246 @@ fn shape_errors_are_reported_not_panics() {
     let mut y = g.stream.alloc_zeros::<f16>(10).unwrap();
     assert!(gemm::linear_f16(&g, &x.as_view(), &w.as_view(), &mut y.as_view_mut(), 2, 4, 3).is_err());
     assert!(g.add_inplace(&mut y.as_view_mut(), &x.slice(0..5)).is_err());
+}
+
+fn dot_rows(x: &[f32], w: &[f32], in_dim: usize) -> Vec<f64> {
+    w.chunks(in_dim)
+        .map(|row| row.iter().zip(x).map(|(&a, &b)| a as f64 * b as f64).sum())
+        .collect()
+}
+
+fn round16(v: f64) -> f32 {
+    f16::from_f64(v).to_f32()
+}
+
+fn gemv_f16_case(seed: u64, in_dim: usize, out_dim: usize) {
+    let g = gpu();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let (x, w) = (
+        rand_f16(&mut rng, in_dim, 1.0),
+        rand_f16(&mut rng, out_dim * in_dim, 0.1),
+    );
+    let (dx, dw) = (g.stream.clone_htod(&x).unwrap(), g.stream.clone_htod(&w).unwrap());
+    let mut dy = g.stream.alloc_zeros::<f16>(out_dim).unwrap();
+    gemm::gemv_f16(
+        &g,
+        &dx.as_view(),
+        &dw.as_view(),
+        &mut dy.as_view_mut(),
+        in_dim,
+        out_dim,
+        None,
+    )
+    .unwrap();
+    let got = f32s(&g.stream.clone_dtoh(&dy).unwrap());
+    let want: Vec<f32> = dot_rows(&f32s(&x), &f32s(&w), in_dim)
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
+    assert_close(&format!("gemv_f16 {out_dim}x{in_dim}"), &got, &want, 2e-3, 1e-3);
+}
+
+#[test]
+fn gemv_f16_matches_cpu() {
+    gemv_f16_case(30, 2048, 3072);
+    gemv_f16_case(31, 40, 77);
+    gemv_f16_case(32, 8 * 333, 9);
+}
+
+fn gemv_f32_case(seed: u64, in_dim: usize, out_dim: usize) {
+    let g = gpu();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let (x, w) = (
+        rand_f16(&mut rng, in_dim, 1.0),
+        rand_f16(&mut rng, out_dim * in_dim, 0.1),
+    );
+    let (dx, dw) = (g.stream.clone_htod(&x).unwrap(), g.stream.clone_htod(&w).unwrap());
+    let mut dy = g.stream.alloc_zeros::<f32>(out_dim).unwrap();
+    gemm::gemv_f32(
+        &g,
+        &dx.as_view(),
+        &dw.as_view(),
+        &mut dy.as_view_mut(),
+        in_dim,
+        out_dim,
+        None,
+    )
+    .unwrap();
+    let got = g.stream.clone_dtoh(&dy).unwrap();
+    let want: Vec<f32> = dot_rows(&f32s(&x), &f32s(&w), in_dim)
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
+    assert_close(&format!("gemv_f32 {out_dim}x{in_dim}"), &got, &want, 1e-4, 1e-4);
+}
+
+#[test]
+fn gemv_f32_lm_head_matches_cpu() {
+    gemv_f32_case(33, 2048, 128256);
+    gemv_f32_case(34, 24, 5);
+}
+
+fn gemv_add_case(seed: u64, in_dim: usize, out_dim: usize) {
+    let g = gpu();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let (x, w) = (
+        rand_f16(&mut rng, in_dim, 1.0),
+        rand_f16(&mut rng, out_dim * in_dim, 0.1),
+    );
+    let y0 = rand_f16(&mut rng, out_dim, 4.0);
+    let (dx, dw) = (g.stream.clone_htod(&x).unwrap(), g.stream.clone_htod(&w).unwrap());
+    let mut dy = g.stream.clone_htod(&y0).unwrap();
+    gemm::gemv_add(&g, &dx.as_view(), &dw.as_view(), &mut dy.as_view_mut(), in_dim, out_dim).unwrap();
+    let got = f32s(&g.stream.clone_dtoh(&dy).unwrap());
+    let want: Vec<f32> = dot_rows(&f32s(&x), &f32s(&w), in_dim)
+        .iter()
+        .zip(&y0)
+        .map(|(&d, y)| round16(y.to_f32() as f64 + round16(d) as f64))
+        .collect();
+    assert_close(&format!("gemv_add {out_dim}x{in_dim}"), &got, &want, 2e-3, 1e-3);
+}
+
+#[test]
+fn gemv_add_matches_cpu() {
+    gemv_add_case(35, 2048, 2048);
+    gemv_add_case(36, 8192, 2048);
+    gemv_add_case(37, 104, 13);
+}
+
+fn gemv_silu_mul_case(seed: u64, in_dim: usize, inter: usize) {
+    let g = gpu();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let (x, w) = (
+        rand_f16(&mut rng, in_dim, 1.0),
+        rand_f16(&mut rng, 2 * inter * in_dim, 0.1),
+    );
+    let (dx, dw) = (g.stream.clone_htod(&x).unwrap(), g.stream.clone_htod(&w).unwrap());
+    let mut dact = g.stream.alloc_zeros::<f16>(inter).unwrap();
+    gemm::gemv_silu_mul(
+        &g,
+        &dx.as_view(),
+        &dw.as_view(),
+        &mut dact.as_view_mut(),
+        in_dim,
+        inter,
+        None,
+    )
+    .unwrap();
+    let got = f32s(&g.stream.clone_dtoh(&dact).unwrap());
+    let gu = dot_rows(&f32s(&x), &f32s(&w), in_dim);
+    let want: Vec<f32> = (0..inter)
+        .map(|i| {
+            let (gt, up) = (round16(gu[i]) as f64, round16(gu[inter + i]) as f64);
+            (gt / (1.0 + (-gt).exp()) * up) as f32
+        })
+        .collect();
+    assert_close(&format!("gemv_silu_mul {inter}x{in_dim}"), &got, &want, 2e-3, 1e-3);
+}
+
+#[test]
+fn gemv_silu_mul_matches_cpu() {
+    gemv_silu_mul_case(38, 2048, 8192);
+    gemv_silu_mul_case(39, 56, 11);
+}
+
+#[test]
+fn gemv_shape_errors() {
+    let g = gpu();
+    let x = g.stream.alloc_zeros::<f16>(64).unwrap();
+    let w = g.stream.alloc_zeros::<f16>(12 * 64).unwrap();
+    let mut y = g.stream.alloc_zeros::<f16>(12).unwrap();
+    let mut y32 = g.stream.alloc_zeros::<f32>(12).unwrap();
+    let mut act = g.stream.alloc_zeros::<f16>(6).unwrap();
+    let (x12, w12) = (x.slice(0..12), w.slice(0..144));
+    assert!(gemm::gemv_f16(&g, &x12, &w12, &mut y.as_view_mut(), 12, 12, None).is_err());
+    assert!(gemm::gemv_f32(&g, &x12, &w12, &mut y32.as_view_mut(), 12, 12, None).is_err());
+    assert!(gemm::gemv_add(&g, &x12, &w12, &mut y.as_view_mut(), 12, 12).is_err());
+    assert!(gemm::gemv_silu_mul(&g, &x12, &w.slice(0..12 * 12), &mut act.as_view_mut(), 12, 6, None).is_err());
+    assert!(gemm::gemv_f16(&g, &x.as_view(), &w.slice(0..640), &mut y.as_view_mut(), 64, 12, None).is_err());
+    assert!(gemm::gemv_silu_mul(
+        &g,
+        &x.as_view(),
+        &w.slice(0..6 * 64),
+        &mut act.as_view_mut(),
+        64,
+        6,
+        None
+    )
+    .is_err());
+    let w56 = |o: usize| w.slice(o..o + 12 * 56);
+    assert!(gemm::gemv_f16(&g, &x.slice(1..57), &w56(0), &mut y.as_view_mut(), 56, 12, None).is_err());
+    assert!(gemm::gemv_f16(&g, &x.slice(0..56), &w56(4), &mut y.as_view_mut(), 56, 12, None).is_err());
+    gemm::gemv_f16(&g, &x.slice(0..56), &w56(8), &mut y.as_view_mut(), 56, 12, None).unwrap();
+    gemm::gemv_silu_mul(&g, &x.as_view(), &w.as_view(), &mut act.as_view_mut(), 64, 6, None).unwrap();
+    let norm = |o: usize, n: usize| (w.slice(o..o + n), 1e-5f32);
+    for (nw, eps) in [norm(0, 56), norm(4, 64)] {
+        let nm = Some(gemm::Norm { w: &nw, eps });
+        assert!(gemm::gemv_f16(&g, &x.as_view(), &w.as_view(), &mut y.as_view_mut(), 64, 12, nm).is_err());
+    }
+    let (nw, eps) = norm(8, 64);
+    let nm = Some(gemm::Norm { w: &nw, eps });
+    gemm::gemv_f16(&g, &x.as_view(), &w.as_view(), &mut y.as_view_mut(), 64, 12, nm).unwrap();
+}
+
+fn rmsnorm_reference(x: &[f32], nw: &[f32], eps: f32) -> Vec<f32> {
+    let ms = x.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / x.len() as f64;
+    let inv = 1.0 / (ms + eps as f64).sqrt();
+    x.iter()
+        .zip(nw)
+        .map(|(&v, &w)| round16(v as f64 * inv * w as f64))
+        .collect()
+}
+
+// RMSNorm fused into the GEMV prologue vs CPU rmsnorm (rounded to FP16 like the rmsnorm kernel) followed by the dot.
+fn gemv_norm_case(seed: u64, in_dim: usize, out_dim: usize) {
+    let g = gpu();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let eps = 1e-5f32;
+    let (x, nw) = (rand_f16(&mut rng, in_dim, 3.0), rand_f16(&mut rng, in_dim, 1.5));
+    let w = rand_f16(&mut rng, 2 * out_dim * in_dim, 0.1);
+    let (dx, dnw, dw) = (
+        g.stream.clone_htod(&x).unwrap(),
+        g.stream.clone_htod(&nw).unwrap(),
+        g.stream.clone_htod(&w).unwrap(),
+    );
+    let xn = rmsnorm_reference(&f32s(&x), &f32s(&nw), eps);
+    let dots = dot_rows(&xn, &f32s(&w), in_dim);
+    let (nwv, wv, w1) = (dnw.as_view(), dw.as_view(), dw.slice(0..out_dim * in_dim));
+    let nm = Some(gemm::Norm { w: &nwv, eps });
+
+    let mut dy = g.stream.alloc_zeros::<f16>(out_dim).unwrap();
+    gemm::gemv_f16(&g, &dx.as_view(), &w1, &mut dy.as_view_mut(), in_dim, out_dim, nm).unwrap();
+    let want: Vec<f32> = dots[..out_dim].iter().map(|&v| v as f32).collect();
+    let got = f32s(&g.stream.clone_dtoh(&dy).unwrap());
+    assert_close(&format!("gemv_f16+norm {out_dim}x{in_dim}"), &got, &want, 2e-3, 1e-3);
+
+    let mut dy32 = g.stream.alloc_zeros::<f32>(out_dim).unwrap();
+    gemm::gemv_f32(&g, &dx.as_view(), &w1, &mut dy32.as_view_mut(), in_dim, out_dim, nm).unwrap();
+    let got = g.stream.clone_dtoh(&dy32).unwrap();
+    assert_close(&format!("gemv_f32+norm {out_dim}x{in_dim}"), &got, &want, 1e-4, 1e-4);
+
+    let mut dact = g.stream.alloc_zeros::<f16>(out_dim).unwrap();
+    gemm::gemv_silu_mul(&g, &dx.as_view(), &wv, &mut dact.as_view_mut(), in_dim, out_dim, nm).unwrap();
+    let want: Vec<f32> = (0..out_dim)
+        .map(|i| {
+            let (gt, up) = (round16(dots[i]) as f64, round16(dots[out_dim + i]) as f64);
+            (gt / (1.0 + (-gt).exp()) * up) as f32
+        })
+        .collect();
+    let got = f32s(&g.stream.clone_dtoh(&dact).unwrap());
+    assert_close(
+        &format!("gemv_silu_mul+norm {out_dim}x{in_dim}"),
+        &got,
+        &want,
+        2e-3,
+        1e-3,
+    );
+}
+
+#[test]
+fn gemv_fused_rmsnorm_matches_cpu() {
+    gemv_norm_case(40, 2048, 3072);
+    gemv_norm_case(41, 2048, 8192);
+    gemv_norm_case(42, 8 * 37, 21);
+    gemv_norm_case(43, 8 * 333, 9);
 }
