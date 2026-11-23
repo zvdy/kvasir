@@ -685,4 +685,5 @@ fn gemv_fused_rmsnorm_matches_cpu() {
     gemv_norm_case(40, 2048, 3072);
     gemv_norm_case(41, 2048, 8192);
     gemv_norm_case(42, 8 * 37, 21);
+    gemv_norm_case(43, 8 * 333, 9);
 }
