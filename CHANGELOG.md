@@ -41,6 +41,12 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
   takes it as a parameter, `Llama::new` rejects head shapes without an attention variant instead of the old
   shared-memory kv-length cap, and `Llama::max_seq_limit` now returns the kernels' i32 bound. `Gpu::attention`
   returns a `Shape` error for misaligned views. Forward and CLI test models use head_dim 64 (tolerances unchanged).
+- Decode (`T = 1`) projections use hand-written FP16 GEMV kernels instead of cuBLAS (P-01, ADR 0007, amends 0002):
+  `gemm::gemv_f16 / gemv_f32 / gemv_add / gemv_silu_mul` with an optional fused RMSNorm prologue (`gemm::Norm`),
+  SwiGLU fused into gate/up and the residual add fused into o/down; 5 launches fewer per layer. Decode 2.8–3.8%
+  faster (ctx 2048: 5.83 → 5.67 ms/token wall, 176 tok/s, 87% of roofline); GEMV kernel bench entries added and
+  baselines regenerated. `Llama::new` now requires hidden / q_dim / intermediate to be multiples of 8. Prefill
+  still uses cuBLAS.
 
 - CI installs Rust with a SHA-pinned action instead of `curl | sh` (Scorecard Pinned-Dependencies).
 - cudarc pinned to the `cuda-13040` feature instead of detecting the toolkit version (CUDA 13.5 is unknown to cudarc 0.19).

@@ -144,3 +144,19 @@ tasks:
       errors instead of misaligned launches. benches/forward.rs: prefill 128 and decode ms/token at ctx 128/512/2048
       vs the decode_bytes roofline, with a stored baseline. Top bottlenecks in DESIGN §8.
 
+  - id: P-01
+    title: Hand-written FP16 decode GEMV with fused epilogues instead of cuBLAS at T=1
+    status: done
+    depends_on: [I-01]
+    files: [engine/kernels/gemv.cu, engine/src/gpu/gemm.rs, engine/src/gpu/kernels.rs, engine/src/model/llama.rs,
+            engine/tests/kernels.rs, engine/benches/kernels.rs, bench/kernels-baseline.json,
+            bench/forward-baseline.json, DESIGN.md, docs/adr/0007-hand-written-decode-gemv.md,
+            docs/adr/0002-cublas-only-for-gemm.md]
+    acceptance:
+      - cargo test --release --features gpu-tests --test kernels --test forward --test cli
+      - make bench
+    notes: >
+      gemv_f16/f32/add/silu_mul with optional fused RMSNorm prologue; T=1 layers are 7 launches. Kernel at the DRAM
+      streaming rate (2.1 us + bytes/470.6 GB/s); qkv 86%, o 83%, gate_up 92%, down 89%, head 94% of 504 GB/s.
+      Decode ctx 2048 5.83 -> 5.67 ms/token. ADR 0007 amends 0002. Next: PDL / rope+kv_append epilogue (DESIGN §8).
+

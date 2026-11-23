@@ -1,19 +1,21 @@
 # kvasir — design notes (Stage 1: Llama 3.2 1B, batch 1)
 
-Target: one RTX 4070 (12 GB, sm_89, ~504 GB/s). Rust + hand-written CUDA kernels, cuBLAS only for GEMMs.
+Target: one RTX 4070 (12 GB, sm_89, ~504 GB/s). Rust + hand-written CUDA kernels; cuBLAS only for GEMMs with T > 1
+(decode GEMVs are hand-written, ADR 0007).
 
 ## 1. Module boundaries
 
 ```
 engine/
   build.rs            nvcc -ptx -arch=sm_89 for kernels/*.cu -> $OUT_DIR/*.ptx (embedded with include_str!)
-  kernels/            embedding.cu rmsnorm.cu rope.cu attention.cu silu_mul.cu elementwise.cu common.cuh
+  kernels/            embedding.cu rmsnorm.cu rope.cu attention.cu silu_mul.cu elementwise.cu gemv.cu common.cuh
   src/error.rs        KvasirError (+ ensure_shape! macro). No unwrap/expect outside tests and main.
   src/gpu/
     device.rs         Gpu { ctx, stream, blas, kernels } — one context, ONE stream (stage 1)
     buffer.rs         DeviceTensor<T>: owned CudaSlice + logical shape, deliberately not Clone
     kernels.rs        one shape-checked launch wrapper per kernel, as methods on Gpu
-    gemm.rs           linear_f16 / linear_f32: cublasGemmEx, FP16 in, FP32 accumulate
+    gemm.rs           linear_f16 / linear_f32: cublasGemmEx, FP16 in, FP32 accumulate (T > 1);
+                      gemv_f16 / gemv_f32 / gemv_add / gemv_silu_mul: decode GEMV, optional fused RMSNorm (§3)
   src/model/
     config.rs         LlamaConfig from config.json (validated; rope_type must be "llama3" or absent)
     rope.rs           host cos/sin tables incl. llama3 long-context frequency scaling
@@ -91,7 +93,8 @@ not in `Workspace`: their row count is the cache capacity `max_seq`, not `max_to
 forward call can rotate is exactly a position the cache can hold, so one bound covers both. `KvCache::new` (generic
 dimensions, no config) builds none and `rope()` then returns an error. 2 × 4096 × 32 × 4 B = 1 MiB for Llama 3.2 1B.
 
-**Prefill vs decode.** Same layer code and same kernels; `T = prompt_len, pos0 = 0` vs `T = 1, pos0 = cur_len`.
+**Prefill vs decode.** Same layer structure; `T = prompt_len, pos0 = 0` vs `T = 1, pos0 = cur_len`. At `T = 1` the
+projections are the fused GEMVs of §3 instead of cuBLAS + separate norm / SwiGLU / add kernels (ADR 0007).
 Query `i` attends to keys `[0, pos0+i]`. Only the *last* row goes through the final norm and LM head during
 generation (the logit-matching test asks for all rows).
 
@@ -100,7 +103,11 @@ memory. `forward(gpu, ids, Logits::Last | Logits::All)` runs `ids` at positions 
 slice of FP32 logits (`[1, vocab]` or `[T, vocab]`, borrowed from the workspace's reused host buffer). Per layer:
 `rmsnorm → W_qkv → rope_inplace → cache.append → cache.attention → W_o → hidden += proj → rmsnorm → W_gu →
 silu_mul → W_down → hidden += proj`; then `cache.advance(T)`, the final norm on the last `T_head` rows only (written
-to the leading rows of `normed`) and the LM head GEMM into `logits`. All views are leading-row slices
+to the leading rows of `normed`) and the LM head GEMM into `logits`. At `T = 1` a layer is `gemv_f16(rmsnorm(hidden)) →
+qkv → rope → append → attention → gemv_add(W_o, attn) into hidden → gemv_silu_mul(rmsnorm(hidden)) → act →
+gemv_add(W_down, act) into hidden` (7 launches; `normed`, `proj` and `gate_up` are not touched), and whenever
+`T_head = 1` (decode, or prefill with `Logits::Last`) the head is `gemv_f32` with the final norm fused, reading the
+last `hidden` row directly. All views are leading-row slices
 (`DeviceTensor::row_view`); nothing is allocated per call. Inputs (`1 ≤ T ≤ max_tokens`, `T_head ≤ max_head_rows`,
 `len + T ≤ max_seq`, ids `< vocab`) are validated before any device work, so a rejected call leaves the sequence
 unchanged; `len` only advances after the last layer. `Llama::new` rejects `max_tokens > max_seq`, head shapes
@@ -137,6 +144,21 @@ prefill). Stats go to stderr (`--json`: one JSON line).
 | `silu_mul` | grid-stride | |
 | `add_inplace` | grid-stride | residual add |
 | `bf16_to_f16` | grid-stride | counts values outside FP16 range |
+| `gemv_{f16,f32,add,silu_mul}` | ⌈rows/8⌉ × 128 | `T = 1` projections; see below |
+
+**Decode GEMV** (P-01, ADR 0007). `y[out] = W[out, in]·x[in]` with `W` in the HF `[out, in]` layout, FP16 in, FP32
+accumulate. One warp owns 2 output rows (`gemv_silu_mul`: one gate row and its up row), 4 warps per block. Lane `l`
+reads the 16-byte chunks `l, l+32, …` of each row with `ld.global.nc.L1::no_allocate` (8 chunks per row in flight);
+the matching x chunk comes through `__ldg` (L1-resident, shared by both rows), then two FP32 FMAs per half2 and a
+5-step shuffle reduction. Out-of-range rows of the last warp re-read the last row and are not stored. Epilogues:
+`f16` (round once), `f32` (logits), `add` (`y = half(y + half(W·x))`, the same two roundings as `proj` + `add_inplace`)
+and `silu_mul` (`act = half(silu(half(g))·half(u))`, as `silu_mul` read the FP16 `gate_up`). Optional prologue: with a
+norm weight the kernel reads the raw hidden row and normalises each x chunk as `half(x·inv·w)` exactly like `rmsnorm`;
+each warp computes `inv` itself from the x chunks it already loaded (`in ≤ 2048`; a second L1 pass otherwise), after
+its weight loads are issued, so the fused norm costs ≈ 0.3 µs instead of a 3.2 µs launch. Wrappers check `in % 8 = 0`
+(else `Shape`), lengths, and 16-byte alignment of `x`, `W` and the norm weight; `Llama::new` rejects configs whose
+hidden / q_dim / intermediate are not multiples of 8. Tuning: rows per warp 1/2/4, 2–8 warps per block, unroll 4/8/16
+and `.cs` / `.nc` / `L2::128B|256B` load variants all measured within ±1% — the kernel is at the DRAM streaming rate.
 
 **Attention** (A-01). One wrapper, `Gpu::attention(qkv, kc, vc, out, scratch, t, pos0, n_q, n_kv, head_dim, max_seq)`,
 dispatches on `t`. Variants are compiled for `head_dim ∈ {64, 128}` × GQA group `g = n_q/n_kv ∈ {1, 2, 4, 8}`; other
@@ -163,7 +185,7 @@ domain (q·k scaled by `log2 e/√d`), with online (running max/sum) softmax.
   V fragments come from `ldmatrix.trans`. Causal mask per element (`key ≤ pos0 + token`); query tiles are scheduled
   longest-first. No split over keys, so prefill with a long prefix and few new tokens under-fills the GPU.
 
-Unit-test results (`cargo test --test kernels`, 25 tests): all outputs are within one FP16 output rounding
+Unit-test results (`cargo test --test kernels`, 31 tests): all outputs are within one FP16 output rounding
 (≈ 4.9e-4 relative) of an f32/f64 CPU reference; FP32-output GEMM is within 7e-7 absolute. Tolerances in the tests
 are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong index or missing term fails loudly.
 
@@ -183,6 +205,8 @@ are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong in
    stay within the unchanged `2e-3 rel + 1e-3 abs` (max error 6.6e-4, same as the old kernel).
 5. **RoPE tables** are computed in f64 and rounded once to f32 (HF: f32 throughout). Difference ~1e-7.
 6. **LM head** outputs FP32 logits directly from the FP16 GEMM (HF-FP32 has FP32 weights; we cannot).
+   At `T = 1` all projections use the GEMV (FP32 accumulate in a fixed lane/shuffle order) instead of cuBLAS, so decode
+   and prefill differ in summation order; the GEMV epilogues keep exactly the FP16 roundings of the separate kernels.
 7. **Tied embeddings:** the embedding matrix doubles as the LM head (`tie_word_embeddings = true` for this model);
    untied checkpoints load a separate `lm_head.weight`.
 8. **Sampling** runs on the host over the FP32 logits (513 KB per step over PCIe, ~30 µs).
@@ -222,6 +246,9 @@ activation. Metric: max |logit error| over all rows.
   over 30 random models × 24 tokens: worst vs FP16-emulated 2.67e-2, vs exact 2.74e-2, decode-vs-prefill 2.51e-2,
   head-only 1.1e-5 (TOL ≈ 1.8× the worst of 30); smallest bug-reference distances 321 / 213 / 187 × TOL (GQA, RoPE,
   causal). The other measurements in this list are from the head_dim-16 model.
+- P-01 (decode GEMV, different summation order than the prefill cuBLAS GEMM): same 30-model sweep, decode-vs-prefill
+  2.51e-2 → 2.82e-2, decode vs FP16-emulated 1.93e-2 → 2.18e-2, vs exact 2.60e-2 → 2.60e-2 (TOL ≈ 1.8× the worst;
+  tolerances unchanged).
 - Power check, asserted in the test: references with a plausible bug differ from the GPU by ≥ 10×TOL; the smallest
   over the 30 models were 13.6 (GQA `h % n_kv` instead of `h / group`), 10.4 (interleaved instead of rotate_half RoPE)
   and 10.3 (query `i` also sees key `i+1`). A uniform position shift is *not* detectable (RoPE is relative), by design.
@@ -256,6 +283,7 @@ activation. Metric: max |logit error| over all rows.
 | kernel microbenchmarks + stored baseline (`make bench`, H-01) | done; numbers in §8 |
 | flash-decoding / FA2 prefill attention (A-01) | done; decode ctx 2048 at 60% of DRAM bandwidth, prefill T=128 25× faster |
 | attention wired into the forward pass, full-size forward bench (I-01) | done; decode 5.84 ms/token at ctx 2048 (84% of roofline), prefill 128 tok in 7.6 ms; §8 |
+| hand-written decode GEMV with fused RMSNorm / SwiGLU / residual add (P-01, ADR 0007) | done; 6 CPU-reference tests (real + odd shapes, shape errors); decode 5.69 ms/token at ctx 2048 (86% of roofline, was 84%) |
 | CLI `kvasir generate` (streamed output, EOS list, prefill/decode tok/s, `--json`) | done (S1-05); `tests/cli.rs` (6 GPU tests running the binary on a synthetic model + in-test WordLevel tokenizer) |
 | ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-06 … S1-08) |
 
@@ -287,6 +315,8 @@ prefill GEMMs:
 | attention, ctx 512 / 2048 / 8192 (A-01) | 7.16 / 14.0 / 43.3 | 29 / 60 / 77 | 6.99 (ctx 128) | 37 (17% FP16 peak) |
 | gemm qkv / o / gate_up / down | 29.7 / 20.5 / 146 / 74.8 | 84 / 81 / 92 / 89 | 46.2 / 28.3 / 187 / 119 | 60 / 64 / 78 / 61 |
 | lm_head (FP32 out) | 1113 | 94 | 1394 | 83 |
+| gemv qkv (+norm) / o+add / gate_up+silu (+norm) / down+add (P-01) | 29.0 (29.3) / 20.1 / 144.5 (144.9) / 74.5 | 86 (85) / 83 / 92 (92) / 89 | – | – |
+| gemv lm_head (+norm), FP32 out (P-01) | 1112 (1113) | 94 (94) | – | – |
 
 Before A-01 attention was 79.5 / 311 / 1231 µs (3% of bandwidth) at decode and 178 µs at prefill: 32 blocks on 46 SMs,
 one thread per key walking 64 elements serially, 2 threads per output dim in P·V, and every KV head read by 4 blocks.
@@ -354,4 +384,44 @@ Gap to roofline at ctx 2048, wall 5.84 − 4.90 = 0.94 ms. Top bottlenecks, larg
    step at 8k). The LM head is at 94% of bandwidth but is 19% of the step; the remaining lever there is bytes
    (quantised head) and returning the argmax/sampled id from the device instead of 513 KB of logits plus a 56 µs host
    argmax (≈ 0.1 ms of host-serial time per generated token in `kvasir generate`).
+
+### Decode GEMV (P-01)
+
+Same benches, `T = 1` projections on the hand-written GEMV of §3 (ADR 0007). Per matrix, µs and % of 504 GB/s
+(weights + x + y bytes):
+
+| matrix | cuBLAS `T=1` | GEMV | GEMV fused (as used) |
+|---|---:|---:|---:|
+| qkv [3072, 2048] | 29.70 (84%) | 28.95 (86%) | + RMSNorm prologue: 29.29 (85%) |
+| o [2048, 2048] | 20.55 (81%) | – | + residual add: 20.14 (83%) |
+| gate_up [16384, 2048] | 145.41 (92%) | + SwiGLU: 144.47 (92%) | + RMSNorm: 144.92 (92%) |
+| down [2048, 8192] | 75.26 (89%) | – | + residual add: 74.46 (89%) |
+| LM head [128256, 2048], FP32 | 1112.1 (94%) | 1112.1 (94%) | + final RMSNorm: 1113.1 (94%) |
+
+The GEMV is at the hardware streaming rate: over plain GEMVs of 1024–16384 rows × 2048 (4–67 MB) the time is
+`2.1 µs + bytes / 470.6 GB/s` to within 0.3 µs, i.e. 93% of spec bandwidth in steady state plus a fixed ≈ 2.1 µs per
+launch (launch gap, DRAM ramp, drain). No launch shape or load flavour moves it (§3). Hence the ≥ 90% target is met by
+the large matrices (gate_up 92%, LM head 94%, down 89–90%) and is out of reach for o (8 MB: best case 2.1 + 17.8 µs =
+84%) and qkv (12.6 MB: 87%) until kernel boundaries overlap. The gain over cuBLAS is mostly the fusions: per layer
+5 launches fewer (2 rmsnorm, silu_mul, 2 add; ≈ 13 µs) and the `normed`/`gate_up`/`proj` round trips.
+
+Forward bench (`make bench-forward`), median ms/token, before = I-01 baseline, after = P-01 (two reruns within 0.1%):
+
+| case | before ms (tok/s, % roofline) | after ms (tok/s, % roofline) | Δ |
+|---|---:|---:|---:|
+| decode ctx 128 wall / device | 5.674 / 5.753 (176, 86%) | 5.515 / 5.534 (181, 89%) | −2.8% / −3.8% |
+| decode ctx 512 wall / device | 5.748 / 5.800 (174, 85%) | 5.560 / 5.580 (180, 88%) | −3.3% / −3.8% |
+| decode ctx 2048 wall / device | 5.833 / 5.911 (171, 84%) | 5.669 / 5.688 (176, 87%) | −2.8% / −3.8% |
+| prefill 128 tokens | 7.654 | 7.653 | 0 (cuBLAS path unchanged) |
+
+Gap to roofline at ctx 2048, wall 5.67 − 4.90 = 0.77 ms, now ≈ 114 launches per token:
+
+1. **DRAM efficiency ceiling: ≈ 0.35 ms.** Streaming 2.47 GB at the measured 470.6 GB/s instead of 504 costs
+   4.90 × (504/470.6 − 1). Not recoverable at FP16; only fewer bytes (FP8/INT8 weights, quantised head) move it.
+2. **Kernel boundaries: ≈ 0.14 ms GEMV + ≈ 0.15 ms small kernels.** 65 GEMV launches × 2.1 µs fixed, plus per layer
+   rope (2.7 µs) + kv_append (1.7 µs) + attention's ≈ 5 µs fixed cost. Next steps: programmatic dependent launch
+   (`cuLaunchKernelEx` + `griddepcontrol`) so each GEMV issues its weight loads while the previous kernel drains (the
+   weights do not depend on it), rope + kv_append fused into the qkv GEMV epilogue (pair rows `j`, `j+32` of a head in
+   one warp), then a CUDA graph for the step.
+3. **Attention KV bytes: ≈ 0.13 ms at ctx 2048** (67 MB, not in the weight roofline); grows with context.
 
