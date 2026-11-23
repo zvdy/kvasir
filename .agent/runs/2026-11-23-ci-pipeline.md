@@ -9,6 +9,7 @@ red on main (rand 0.10, fixed in agent/fix-2026-11-23 / #4, which this branch is
 - .github/workflows/agent-pr.yml, scripts/check-agent-pr.sh: run log + GPU evidence + CHANGELOG + backlog status check
 - Makefile: `build-gpu-tests` (in `ci`), `check-agent-pr`
 - AGENTS.md, .claude/skills/maintain/SKILL.md, .claude/agents/reviewer.md: gates per ADR 0006, `/maintain parallel`
+- scripts/hooks/no-push-main.sh: judge the branch of the directory the push runs in (cwd or `git -C`), not $CLAUDE_PROJECT_DIR; catches `git -C <dir> push`; 10 cases tested
 - .gitignore: .claude/worktrees/ (subagent worktrees)
 - .claude/settings.json: allow gh pr checks / run view, git worktree, merge origin/main, flock'd make/cargo
 - .github/pull_request_template.md: GPU test output block, required checks item

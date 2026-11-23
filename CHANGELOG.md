@@ -17,6 +17,7 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
   behind one required `ci-pass` check; shared setup in `.github/actions/setup`.
 - New `agent-pr` check (`scripts/check-agent-pr.sh`, `make check-agent-pr`): agent PRs need a run log with local
   `make test-gpu` results, a CHANGELOG entry and an updated backlog status (ADR 0006).
+- Push hook checks the branch of the directory a push runs in, so agents in worktrees can push and `git -C` cannot bypass it.
 - Harness allows parallel agent runs in separate worktrees for non-overlapping tasks (`/maintain parallel`).
 - Backlog: S1-09 batch-1 comparison against llama.cpp and vLLM.
 - CI installs Rust with a SHA-pinned action instead of `curl | sh` (Scorecard Pinned-Dependencies).
