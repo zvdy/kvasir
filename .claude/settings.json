@@ -17,7 +17,15 @@
       "Bash(gh pr view*)",
       "Bash(gh pr create*)",
       "Bash(nvidia-smi*)",
-      "Bash(scripts/doctor.sh)"
+      "Bash(scripts/doctor.sh)",
+      "Bash(gh pr checks*)",
+      "Bash(gh run view*)",
+      "Bash(gh run list*)",
+      "Bash(git worktree*)",
+      "Bash(git merge origin/main*)",
+      "Bash(scripts/check-agent-pr.sh*)",
+      "Bash(flock /tmp/kvasir-gpu.lock make *)",
+      "Bash(flock /tmp/kvasir-gpu.lock cargo *)"
     ],
     "deny": [
       "Bash(git push * main*)",
@@ -32,7 +40,12 @@
     "PreToolUse": [
       {
         "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/no-push-main.sh" }]
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/no-push-main.sh"
+          }
+        ]
       }
     ]
   }
