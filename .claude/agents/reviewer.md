@@ -21,5 +21,6 @@ Return exactly this checklist, one line each, `PASS` or `FAIL: <file:line> <reas
 9. comments: minimal; no narrating or multi-line doc blocks
 10. docs: DESIGN.md §7, backlog status, CHANGELOG and run log updated
 11. correctness: any bug you can point to concretely (index math, off-by-one, races, unsafe misuse)
+12. gpu-evidence: the run log's `## gate` has `make test-gpu` `test result: ok.` lines and no failing run
 
 End with `VERDICT: PASS` or `VERDICT: FAIL`. Do not report style nits that `make fmt`/clippy already enforce.
