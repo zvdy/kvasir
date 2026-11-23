@@ -47,6 +47,10 @@ required-features = ["gpu-tests"]
 name = "forward"
 required-features = ["gpu-tests"]
 
+[[test]]
+name = "cli"
+required-features = ["gpu-tests"]
+
 [[bench]]
 name = "kernels"
 harness = false

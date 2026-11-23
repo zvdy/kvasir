@@ -9,6 +9,8 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
 
 - `model::Workspace`: preallocated activation buffers sized by `WorkspaceDims` from `LlamaConfig`, max tokens per
   call and max LM-head rows; token-id upload and logits D2H reuse preallocated host buffers (S1-01).
+- Host sampling (`engine/src/sampling.rs`): greedy, temperature and top-p with a seeded `StdRng`; no per-step heap
+  allocation, nucleus found by partial selection instead of a full vocab sort.
 - Agent maintenance harness: `AGENTS.md`, `.agent/backlog.yaml`, `/maintain` skill, `reviewer` subagent, `make doctor`.
 - `make ci` / `make ci-local` gates; GPU tests gated behind the `gpu-tests` feature.
 - Apache-2.0 license, governance docs, CI (CUDA container build, cargo-deny, DCO, OpenSSF Scorecard), ADRs.
@@ -19,6 +21,9 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
   now owns the RoPE cos/sin tables; `DeviceTensor::row_view(_mut)` give leading/ranged row views (S1-03).
 - Kernel microbenchmarks (`make bench`) at Llama 3.2 1B decode/prefill shapes, compared against
   `bench/kernels-baseline.json` (fails on > 10% regression); `make bench-baseline` rewrites it.
+- `kvasir generate --model <dir> --prompt <text> --max-tokens N --seed S [--temperature T --top-p P]`: chunked
+  prefill, streamed output, stops at any EOS id from config/generation_config, prints prefill and decode tok/s to
+  stderr (`--json` for one JSON line, `--ignore-eos` for fixed-length runs). `Llama::max_seq_limit` (S1-05).
 
 ### Changed
 

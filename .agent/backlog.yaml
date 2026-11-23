@@ -52,7 +52,7 @@ tasks:
 
   - id: S1-04
     title: Host sampling (greedy, temperature, top-p)
-    status: todo
+    status: done
     depends_on: []
     files: [engine/src/sampling.rs]
     acceptance:
@@ -61,7 +61,7 @@ tasks:
 
   - id: S1-05
     title: CLI `kvasir generate`
-    status: todo
+    status: done
     depends_on: [S1-03, S1-04]
     files: [engine/src/bin/kvasir.rs]
     acceptance:
