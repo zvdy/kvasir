@@ -208,8 +208,7 @@ impl Ctx<'_> {
             step(&mut self.model)?;
             wall.push(t0.elapsed().as_secs_f64() * 1e3);
         }
-        // Device time: the step is queued behind a filler several times longer than its wall time,
-        // so every launch is enqueued before the GPU reaches it and launch latency drops out.
+        // Device time: queued behind a filler ≥ 3x the step's wall time so launch latency drops out (DESIGN §8).
         let wall_med = stats(wall.clone()).0;
         let filler_reps = ((3.0 * wall_med / 0.35).ceil() as usize).clamp(4, 400);
         let start = gpu.ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;

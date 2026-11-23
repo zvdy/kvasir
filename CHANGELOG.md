@@ -24,6 +24,10 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
 - `kvasir generate --model <dir> --prompt <text> --max-tokens N --seed S [--temperature T --top-p P]`: chunked
   prefill, streamed output, stops at any EOS id from config/generation_config, prints prefill and decode tok/s to
   stderr (`--json` for one JSON line, `--ignore-eos` for fixed-length runs). `Llama::max_seq_limit` (S1-05).
+- End-to-end forward bench (`make bench-forward`, also run by `make bench`): synthetic full-size Llama 3.2 1B,
+  prefill 128 tokens and decode at ctx 128/512/2048 (wall and device time, % of the `decode_bytes` roofline),
+  compared against `bench/forward-baseline.json` (> 10% regression fails). Decode: 5.67–5.83 ms/token (171–176
+  tok/s, 84–86% of roofline); prefill 128 tokens: 7.65 ms (I-01).
 
 ### Changed
 
@@ -33,6 +37,10 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
   T=128: 178 → 7.0 µs. The ≈11.9k kv-length cap is gone. **Breaking:** `Gpu::attention` takes a new
   `scratch: &mut CudaViewMut<f32>` (size `kernels::attention_scratch_len(n_q, head_dim)`, zeroed once at allocation)
   and supports head_dim 64/128 with GQA groups 1/2/4/8.
+- The forward pass uses the A-01 attention (I-01): `Workspace` owns the zeroed `attn_scratch`, `KvCache::attention`
+  takes it as a parameter, `Llama::new` rejects head shapes without an attention variant instead of the old
+  shared-memory kv-length cap, and `Llama::max_seq_limit` now returns the kernels' i32 bound. `Gpu::attention`
+  returns a `Shape` error for misaligned views. Forward and CLI test models use head_dim 64 (tolerances unchanged).
 
 - CI installs Rust with a SHA-pinned action instead of `curl | sh` (Scorecard Pinned-Dependencies).
 - cudarc pinned to the `cuda-13040` feature instead of detecting the toolkit version (CUDA 13.5 is unknown to cudarc 0.19).

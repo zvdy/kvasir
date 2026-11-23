@@ -128,3 +128,19 @@ tasks:
       Decode split-K over context with GQA-shared K/V loads and online softmax; tiled causal prefill. Remove the
       ~11.9k kv-length cap. Target decode ctx 2048 >= 60% of bandwidth, prefill >= 10x. Wrapper gains a `scratch`
       parameter (`attention_scratch_len`); callers outside this branch (KvCache::attention) adapt on merge.
+
+  - id: I-01
+    title: Wire flash-decoding attention into the forward pass; full-size decode bench
+    status: done
+    depends_on: [S1-03, A-01]
+    files: [engine/src/kv/mod.rs, engine/src/model/llama.rs, engine/src/model/workspace.rs, engine/src/gpu/kernels.rs,
+            engine/tests/forward.rs, engine/tests/kv.rs, engine/tests/workspace.rs, engine/tests/cli.rs,
+            engine/benches/forward.rs, bench/forward-baseline.json, Makefile, DESIGN.md]
+    acceptance:
+      - cargo test --release --features gpu-tests --test forward --test kv --test kernels
+      - make bench
+    notes: >
+      Workspace owns the attention scratch; Llama::new checks attention variants instead of the smem cap; alignment
+      errors instead of misaligned launches. benches/forward.rs: prefill 128 and decode ms/token at ctx 128/512/2048
+      vs the decode_bytes roofline, with a stored baseline. Top bottlenecks in DESIGN §8.
+

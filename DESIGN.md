@@ -25,13 +25,17 @@ engine/
   src/bin/kvasir.rs   `kvasir generate`: tokenize, chunked prefill, decode loop, streamed text, tok/s on stderr
 engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint), workspace.rs, kv.rs (cache placement),
                       forward.rs (tiny model vs CPU f64 reference forward)
-engine/benches/       kernels.rs: per-kernel microbenchmarks vs bench/kernels-baseline.json (`make bench`)
+engine/benches/       kernels.rs: per-kernel microbenchmarks vs bench/kernels-baseline.json;
+                      forward.rs: synthetic full-size 1B prefill/decode vs bench/forward-baseline.json (`make bench`)
 tests/ , ref/         logit-matching test and HF reference dumper        [not written yet]
 ```
 
 Ownership: device memory is owned by exactly three long-lived structs — `Weights`, `KvCache`,
 `Workspace`. Kernel wrappers take borrowed `CudaView`/`CudaViewMut`, never allocate. The generation
 loop therefore performs no device allocation (the logits D2H copy goes into a reused host `Vec`).
+The attention split-K scratch is per-call working memory, so `Workspace` owns it (sized from `n_q`, `head_dim`);
+`KvCache` holds only sequence state (K/V, RoPE tables, `len`), and `KvCache::attention` takes the scratch as an
+argument exactly like the kernel wrapper.
 
 ## 2. Data layouts
 
@@ -55,8 +59,9 @@ Conventions: everything is row-major, contiguous, FP16 unless stated. `T` = numb
 **Workspace.** Allocated once for `max_tokens` (T upper bound) and `max_head_rows` (T_head upper bound, 1 for
 generation): `ids [T] i32`, `hidden`/`normed`/`proj [T, hidden]` (`proj` = o_proj / down_proj output before the
 residual add), `qkv [T, qkv_dim]`, `attn [T, q_dim]`, `gate_up [T, 2·inter]`, `act [T, inter]`, `logits [T_head, vocab]`
-FP32, plus host buffers for the ids and the logits copy. A call with `t` tokens uses the leading `t` rows of each
-buffer. Llama 3.2 1B: 70 KiB per token of FP16 activations + 501 KiB per head row.
+FP32, `attn_scratch [attention_scratch_len(n_q, head_dim)]` FP32 (zeroed at allocation, one buffer for all layers,
+§3), plus host buffers for the ids and the logits copy. A call with `t` tokens uses the leading `t` rows of each
+buffer. Llama 3.2 1B: 70 KiB per token of FP16 activations + 501 KiB per head row + 1.08 MB attention scratch.
 
 **Linear layers.** Weights stay in HF `[out, in]` layout. `Y[T,out] = X[T,in] · Wᵀ` is issued to
 cuBLAS (column-major) as `C[out×T] = op_T(A) · B` with `A = W` (`[in×out]` col-major, lda = in), `B = X`
@@ -98,10 +103,14 @@ silu_mul → W_down → hidden += proj`; then `cache.advance(T)`, the final norm
 to the leading rows of `normed`) and the LM head GEMM into `logits`. All views are leading-row slices
 (`DeviceTensor::row_view`); nothing is allocated per call. Inputs (`1 ≤ T ≤ max_tokens`, `T_head ≤ max_head_rows`,
 `len + T ≤ max_seq`, ids `< vocab`) are validated before any device work, so a rejected call leaves the sequence
-unchanged; `len` only advances after the last layer. `Llama::new` rejects `max_tokens > max_seq` and a `max_seq`
-above the attention kernel's shared-memory limit (`(max_seq + head_dim + 128)·4 B ≤ 48 KiB`, 12 096 for
-head_dim 64), so the limit surfaces at construction instead of mid-generation. `reset`/`truncate` rewind the cache.
-`Llama::max_seq_limit(head_dim)` exposes that bound.
+unchanged; `len` only advances after the last layer. `Llama::new` rejects `max_tokens > max_seq`, head shapes
+without an attention variant (`head_dim ∉ {64, 128}` or GQA group `∉ {1, 2, 4, 8}`) and `max_seq >
+max_position_embeddings` (in `KvCache::from_config`), so limits surface at construction instead of mid-generation.
+Since A-01 the kernels have no kv-length cap of their own: `Llama::max_seq_limit(head_dim)` = `i32::MAX` (`max_seq`
+is an i32 kernel argument; cache offsets are 64-bit); the KV cache size is the practical bound (32 KiB per token for
+1B). The attention wrapper also returns a `Shape` error if `qkv`/`kc`/`vc` are not 16-byte aligned or `out`/`scratch`
+not 4-byte aligned; every view `forward` passes is aligned by construction (leading-row slices of fresh allocations;
+per-layer cache offsets are multiples of `max_seq·head_dim·2 B`). `reset`/`truncate` rewind the cache.
 
 **Generation (`kvasir generate`).** The prompt is encoded with the tokenizer's post-processor (Llama 3 adds BOS
 128000); BOS is prepended only if the first id is not already BOS. EOS ids are the union of `config.json` and
@@ -145,8 +154,8 @@ domain (q·k scaled by `log2 e/√d`), with online (running max/sum) softmax.
 - *Scratch:* `scratch: &mut CudaViewMut<f32>` with at least `kernels::attention_scratch_len(n_q, head_dim)` =
   `n_q + 128·n_q·(head_dim+2)` floats (1.08 MB for Llama 3.2 1B, one buffer shared by all layers). Layout: `n_q` u32
   counter words, then partials `[split, n_q, head_dim+2]`. It must be **zeroed once at allocation** (`alloc_zeros`);
-  every call leaves the counters at zero. Prefill does not touch it. Owned by `Workspace` (or the KV cache) — the
-  wrapper does not allocate.
+  every call leaves the counters at zero. Prefill does not touch it. Owned by `Workspace` (`attn_scratch`, I-01) —
+  the wrapper does not allocate.
 - *Prefill:* block = 64/g query tokens × g heads of one KV head = 64 query rows, 4 warps × 16 rows. Q fragments live
   in registers; K/V tiles (64 keys for hd 64, 32 for hd 128) are double-buffered in smem with `cp.async` (zero-filled
   past the causal end, rows padded by 16 B for conflict-free access). S = QKᵀ and O += PV use
@@ -193,9 +202,9 @@ are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong in
 
 ## 6. Verification plan
 
-**Forward-pass test thresholds (`tests/forward.rs`, synthetic model).** The tiny config of `tests/weights.rs`
-(hidden 64, 2 layers, 4 q / 2 kv heads of 16, inter 128, vocab 100) with random BF16 weights (linear `U(±√(3/in))`,
-norms `U(0.5, 1.5)`, embedding `U(±1)`; logit rms ≈ 5) is run on the GPU and compared with an f64 CPU forward
+**Forward-pass test thresholds (`tests/forward.rs`, synthetic model).** A tiny config (hidden 256, 2 layers, 4 q /
+2 kv heads of 64, inter 128, vocab 100) with random BF16 weights (linear `U(±√(3/in))`, norms `U(0.5, 1.5)`,
+embedding `U(±0.5)`; logit rms ≈ 5) is run on the GPU and compared with an f64 CPU forward
 written in the test, in two flavours: exact, and one that rounds to FP16 at every point where the GPU stores an FP16
 activation. Metric: max |logit error| over all rows.
 
@@ -207,6 +216,12 @@ activation. Metric: max |logit error| over all rows.
 - Measured over 30 random models × 24 tokens: worst vs FP16-emulated 2.14e-2, vs exact 2.40e-2, decode-vs-prefill
   1.99e-2. **`TOL = 5e-2`** (≈ 2× the worst of 30, ≈ 1% of logit rms) for every comparison that crosses an FP16
   rounding: GPU vs either reference, decode vs prefill, chunked prefill + decode vs reference, truncate + recompute.
+- I-01 moved the model from heads of 16 (hidden 64, embedding `U(±1)`) to heads of 64, because the A-01 attention
+  kernels only exist for head_dim 64/128. Logit and error both scale with `√hidden·|E|`, so the embedding range was
+  halved with the 4× wider hidden to keep logit rms ≈ 5 and TOL at ≈ 1% of it; tolerances are unchanged. Re-measured
+  over 30 random models × 24 tokens: worst vs FP16-emulated 2.67e-2, vs exact 2.74e-2, decode-vs-prefill 2.51e-2,
+  head-only 1.1e-5 (TOL ≈ 1.8× the worst of 30); smallest bug-reference distances 321 / 213 / 187 × TOL (GQA, RoPE,
+  causal). The other measurements in this list are from the head_dim-16 model.
 - Power check, asserted in the test: references with a plausible bug differ from the GPU by ≥ 10×TOL; the smallest
   over the 30 models were 13.6 (GQA `h % n_kv` instead of `h / group`), 10.4 (interleaved instead of rotate_half RoPE)
   and 10.3 (query `i` also sees key `i+1`). A uniform position shift is *not* detectable (RoPE is relative), by design.
@@ -240,10 +255,13 @@ activation. Metric: max |logit error| over all rows.
 | forward pass (`Llama::forward`, prefill / chunked prefill / decode) | done (S1-03); `tests/forward.rs` (6 GPU tests vs f64 CPU reference on a synthetic model, thresholds §6) |
 | kernel microbenchmarks + stored baseline (`make bench`, H-01) | done; numbers in §8 |
 | flash-decoding / FA2 prefill attention (A-01) | done; decode ctx 2048 at 60% of DRAM bandwidth, prefill T=128 25× faster |
+| attention wired into the forward pass, full-size forward bench (I-01) | done; decode 5.84 ms/token at ctx 2048 (84% of roofline), prefill 128 tok in 7.6 ms; §8 |
 | CLI `kvasir generate` (streamed output, EOS list, prefill/decode tok/s, `--json`) | done (S1-05); `tests/cli.rs` (6 GPU tests running the binary on a synthetic model + in-test WordLevel tokenizer) |
 | ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-06 … S1-08) |
 
-## 8. Kernel microbenchmarks
+## 8. Benchmarks
+
+### Kernel microbenchmarks
 
 `make bench` (`engine/benches/kernels.rs`, `harness = false`, needs `gpu-tests`) times every kernel at Llama 3.2 1B
 dims, decode (`T=1`) and prefill (`T=128`), and fails if any median is > 10% slower than `bench/kernels-baseline.json`;
@@ -279,3 +297,61 @@ roofline. Decode attention has a ~4 µs fixed cost per call (launch gap, DRAM la
 bandwidth. The small kernels are launch-bound (~1.3–3.3 µs each, ~10 per layer) and call for fusion and CUDA graphs:
 ≈ 16 × 15 µs ≈ 0.25 ms/token. Remaining gap to the roofline at ctx 2048: GEMM shortfall ≈ 0.5 ms, small kernels
 ≈ 0.25 ms, attention ≈ 0.1 ms (its fixed cost).
+
+### End-to-end forward (I-01)
+
+`make bench-forward` (`engine/benches/forward.rs`; `make bench` runs it after the kernel bench) builds the real
+Llama 3.2 1B shapes (hidden 2048, 16 layers, 32/8 heads of 64, inter 8192, vocab 128256, tied head, llama3 RoPE) with
+seeded random weights uploaded from host pools (0.2 s) and a 4096-position cache, then times through `Llama::forward`:
+prefill of 128 tokens from an empty cache, and decode at ctx 128 / 512 / 2048 (cache filled by 128-token prefill
+chunks, `truncate(ctx)` before every step so the context is exact; 10 warm-up + 60 timed steps, `Logits::Last`).
+*wall* = host `Instant` around the whole call (ids upload, launches, logits D2H, sync), i.e. the latency a caller
+sees; *device* = CUDA events around the call while it is queued behind a filler GEMM ≥ 3× its wall time, so host
+launch latency is hidden. The logits D2H (128256 FP32) and a host argmax are timed separately, not gated. Medians;
+`bench/forward-baseline.json`, fails on > 10% regression of any gated median (same rule as the kernel bench, one
+gate for both; reruns agree within 1%). Roofline = `Weights::decode_bytes()` 2.472 GB / 504 GB/s = 4.904 ms/token.
+
+| case | median ms | tok/s | % of roofline |
+|---|---:|---:|---:|
+| prefill 128 tokens | 7.65 | 16 700 | – |
+| decode ctx 128 (wall / device) | 5.67 / 5.75 | 176 | 86 / 85 |
+| decode ctx 512 | 5.75 / 5.80 | 174 | 85 / 85 |
+| decode ctx 2048 | 5.83 / 5.91 | 171 | 84 / 83 |
+| logits D2H + sync / host argmax | 0.040 / 0.056 | | |
+
+Wall ≤ device: the host enqueues the ≈ 180 launches of a step faster than the GPU drains them (the 145 µs gate/up
+GEMMs and the 1.1 ms LM head give it slack), so host launch overhead is already off the critical path and a CUDA
+graph alone would only remove inter-kernel gaps. Decode is GPU-bound.
+
+**Decode step breakdown, ctx 2048** (temporary CUDA events after every op, behind the filler; the events add ≈ 1 µs
+per op, total 6.14 ms vs 5.91 ms unprofiled), µs per token:
+
+| op (calls) | µs | per call | % of DRAM bw |
+|---|---:|---:|---:|
+| gate_up GEMM (16) | 2309 | 144.3 | 92 |
+| down GEMM (16) | 1199 | 74.9 | 89 |
+| LM head, FP32 out (1) | 1105 | 1105 | 94 |
+| qkv GEMM (16) | 484 | 30.3 | 83 |
+| o GEMM (16) | 340 | 21.3 | 78 |
+| attention (16) | 246 (94 at ctx 128) | 15.4 (5.9) | 54 |
+| rmsnorm (33) | 182 | 5.5 | – |
+| add (32) | 79 | 2.5 | – |
+| rope / kv_append / silu_mul / embedding (49) | 150 | 2.5–5 | – |
+| logits D2H (1) | 51 | 51 | – |
+
+Gap to roofline at ctx 2048, wall 5.84 − 4.90 = 0.94 ms. Top bottlenecks, largest first:
+
+1. **cuBLAS GEMV efficiency at T = 1: ≈ 0.54 ms.** The five weight GEMMs take 5.44 ms against 4.90 ms of weight
+   bytes; o (78%) and qkv (83%) are worst, gate_up/down lose 0.32 ms between them. A hand-written split-K FP16 GEMV
+   at ≥ 95% of bandwidth (and fusing silu_mul into the gate_up epilogue, the residual add into o/down) would recover
+   ≈ 0.35–0.45 ms (≈ +7% tok/s).
+2. **Small kernels: ≈ 0.3 ms** (≈ 130 launches of 2.5–5.5 µs, ≈ 0.4 ms with event overhead), each latency-bound on
+   a 4 KB row. Fusions: residual add + next RMSNorm (removes 32 launches and the `proj` round trip), rope +
+   kv_append (16), silu_mul into the GEMV (16); then a CUDA graph for the remaining inter-kernel gaps. Estimated
+   gain ≈ 0.2–0.25 ms.
+3. **Attention fixed cost and the LM head: ≈ 0.1 + 0.1 ms.** Attention at ctx 2048 moves 67 MB of KV (133 µs at
+   roofline) in 246 µs; ≈ 5 µs of each call is fixed (94 µs total at ctx 128), so it grows with context (≈ 20% of the
+   step at 8k). The LM head is at 94% of bandwidth but is 19% of the step; the remaining lever there is bytes
+   (quantised head) and returning the argmax/sampled id from the device instead of 513 KB of logits plus a 56 µs host
+   argmax (≈ 0.1 ms of host-serial time per generated token in `kvasir generate`).
+

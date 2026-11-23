@@ -57,8 +57,7 @@ impl Llama {
         })
     }
 
-    /// Longest cache the attention kernels can index (`max_seq` is passed as i32; offsets are 64-bit).
-    /// Independent of `head_dim` since A-01; `max_position_embeddings` still bounds it in `KvCache::from_config`.
+    /// Longest cache the attention kernels can index (i32 `max_seq`); see DESIGN.md §2 "Forward pass".
     pub const fn max_seq_limit(_head_dim: usize) -> usize {
         i32::MAX as usize
     }

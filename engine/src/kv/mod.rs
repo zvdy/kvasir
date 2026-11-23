@@ -3,8 +3,6 @@ use half::f16;
 
 use crate::ensure_shape;
 use crate::error::{KvasirError, Result};
-#[cfg(doc)]
-use crate::gpu::kernels::attention_scratch_len;
 use crate::gpu::{DeviceTensor, Gpu};
 use crate::model::{rope, LlamaConfig};
 
@@ -139,8 +137,7 @@ impl KvCache {
         gpu.kv_append(qkv, &mut k, &mut v, t, pos0, n_q, n_kv, head_dim, max_seq)
     }
 
-    /// Causal attention of `t` queries at positions `len..len+t` over keys `0..len+t` of `layer`.
-    /// `scratch` is the workspace's zero-initialised [`attention_scratch_len`] buffer.
+    /// Causal attention of `t` queries at positions `len..len+t` over keys `0..len+t` of `layer` (scratch: DESIGN §3).
     #[allow(clippy::too_many_arguments)]
     pub fn attention(
         &self,
