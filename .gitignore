@@ -4,3 +4,4 @@
 /ref/out
 __pycache__
 .claude/settings.local.json
+.claude/worktrees/
