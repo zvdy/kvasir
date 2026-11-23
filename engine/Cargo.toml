@@ -34,3 +34,7 @@ required-features = ["gpu-tests"]
 [[test]]
 name = "weights"
 required-features = ["gpu-tests"]
+
+[[test]]
+name = "workspace"
+required-features = ["gpu-tests"]

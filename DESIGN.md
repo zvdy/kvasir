@@ -19,11 +19,11 @@ engine/
     rope.rs           host cos/sin tables incl. llama3 long-context frequency scaling
     weights.rs        mmap safetensors -> GPU, BF16->FP16 on device, QKV and gate/up fused
     llama.rs          forward pass (prefill / decode)                    [not written yet]
-    workspace.rs      preallocated activation buffers                    [not written yet]
+    workspace.rs      Workspace: preallocated activations; WorkspaceDims = pure size math
   src/kv/             contiguous KV cache                                [not written yet]
   src/sampling.rs     greedy / temperature / top-p on host               [not written yet]
   src/bin/kvasir.rs   `kvasir generate --model <dir> --prompt ...`       [not written yet]
-engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint)
+engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint), workspace.rs
 tests/ , ref/         logit-matching test and HF reference dumper        [not written yet]
 ```
 
@@ -49,6 +49,12 @@ Conventions: everything is row-major, contiguous, FP16 unless stated. `T` = numb
 | gate/up activation | `[T, 16384]` | `silu_mul` reads it, writes `[T, 8192]` |
 | logits | `[T_head, 128256]` FP32 | never rounded to FP16 |
 | RoPE cos/sin | `[max_seq, 32]` FP32 | built on host, uploaded once |
+
+**Workspace.** Allocated once for `max_tokens` (T upper bound) and `max_head_rows` (T_head upper bound, 1 for
+generation): `ids [T] i32`, `hidden`/`normed`/`proj [T, hidden]` (`proj` = o_proj / down_proj output before the
+residual add), `qkv [T, qkv_dim]`, `attn [T, q_dim]`, `gate_up [T, 2·inter]`, `act [T, inter]`, `logits [T_head, vocab]`
+FP32, plus host buffers for the ids and the logits copy. A call with `t` tokens uses the leading `t` rows of each
+buffer. Llama 3.2 1B: 70 KiB per token of FP16 activations + 501 KiB per head row.
 
 **Linear layers.** Weights stay in HF `[out, in]` layout. `Y[T,out] = X[T,in] · Wᵀ` is issued to
 cuBLAS (column-major) as `C[out×T] = op_T(A) · B` with `A = W` (`[in×out]` col-major, lda = in), `B = X`
@@ -140,4 +146,5 @@ are `1.5–2e-3 rel + 1e-3 abs`, i.e. ~3–4× the rounding floor, so a wrong in
 | 8 kernels + CPU-reference tests, GEMM test | done, 16/16 passing |
 | config, RoPE table, weight loader | done; loader tested on a synthetic BF16 checkpoint (exact fused-layout check) |
 | real Llama 3.2 1B weights | **missing**: gated repo, backlog `ENV-weights` |
-| forward pass, KV cache, sampling, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-01 … S1-08) |
+| workspace (activation buffers, ids upload, logits D2H into a reused host buffer) | done (S1-01); CPU size tests + GPU alloc/round-trip test |
+| forward pass, KV cache, sampling, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-02 … S1-08) |

@@ -17,7 +17,7 @@ tasks:
 
   - id: S1-01
     title: Workspace of preallocated activation buffers
-    status: todo
+    status: done
     depends_on: []
     files: [engine/src/model/workspace.rs, engine/src/model/mod.rs]
     acceptance:

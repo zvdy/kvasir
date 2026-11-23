@@ -7,6 +7,8 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
 
 ### Added
 
+- `model::Workspace`: preallocated activation buffers sized by `WorkspaceDims` from `LlamaConfig`, max tokens per
+  call and max LM-head rows; token-id upload and logits D2H reuse preallocated host buffers (S1-01).
 - Agent maintenance harness: `AGENTS.md`, `.agent/backlog.yaml`, `/maintain` skill, `reviewer` subagent, `make doctor`.
 - `make ci` / `make ci-local` gates; GPU tests gated behind the `gpu-tests` feature.
 - Apache-2.0 license, governance docs, CI (CUDA container build, cargo-deny, DCO, OpenSSF Scorecard), ADRs.
