@@ -21,7 +21,7 @@ engine/
     llama.rs          Llama { cfg, Weights, KvCache, Workspace }: forward(ids, Logits::Last | All)
     workspace.rs      Workspace: preallocated activations; WorkspaceDims = pure size math
   src/kv/             KvCache: contiguous K/V, per-layer views, length + bounds tracking
-  src/sampling.rs     greedy / temperature / top-p on host               [not written yet]
+  src/sampling.rs     greedy / temperature / top-p on host (Sampler, reused scratch, seeded StdRng)
   src/bin/kvasir.rs   `kvasir generate --model <dir> --prompt ...`       [not written yet]
 engine/tests/         kernels.rs (per-kernel vs CPU), weights.rs (synthetic checkpoint), workspace.rs, kv.rs (cache placement),
                       forward.rs (tiny model vs CPU f64 reference forward)
@@ -191,8 +191,9 @@ activation. Metric: max |logit error| over all rows.
 | gpu wrappers, build.rs | done |
 | 8 kernels + CPU-reference tests, GEMM test | done, 16/16 passing |
 | config, RoPE table, weight loader | done; loader tested on a synthetic BF16 checkpoint (exact fused-layout check) |
+| host sampling (greedy, temperature, top-p) | done; seeded, partial-select nucleus, 12 CPU tests |
 | real Llama 3.2 1B weights | **missing**: gated repo, backlog `ENV-weights` |
 | workspace (activation buffers, ids upload, logits D2H into a reused host buffer) | done (S1-01); CPU size tests + GPU alloc/round-trip test |
 | KV cache (`KvCache`) | done (S1-02); `tests/kv.rs` (6 GPU tests: exact placement at several `pos0`, overflow errors, attention via layer view) |
 | forward pass (`Llama::forward`, prefill / chunked prefill / decode) | done (S1-03); `tests/forward.rs` (6 GPU tests vs f64 CPU reference on a synthetic model, thresholds §6) |
-| sampling, CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-04 … S1-08) |
+| CLI, ref script, logit test, perf report | ordered in `.agent/backlog.yaml` (S1-05 … S1-08) |
