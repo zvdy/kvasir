@@ -9,6 +9,8 @@ versioning: [SemVer](https://semver.org/) (pre-1.0, minor versions may break).
 
 - Agent maintenance harness: `AGENTS.md`, `.agent/backlog.yaml`, `/maintain` skill, `reviewer` subagent, `make doctor`.
 - `make ci` / `make ci-local` gates; GPU tests gated behind the `gpu-tests` feature.
+- `ref/dump_logits.py` and `make ref`: HF FP32/FP16 reference logits and greedy tokens as raw f32/u32 files plus
+  `meta.json` (format in DESIGN.md §6); skips cleanly when weights are absent.
 - Apache-2.0 license, governance docs, CI (CUDA container build, cargo-deny, DCO, OpenSSF Scorecard), ADRs.
 
 ### Changed
